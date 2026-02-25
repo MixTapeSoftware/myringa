@@ -12,6 +12,9 @@ var (
 	FrozenStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
 	HelpStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	ErrorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	PromptStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Bold(true)
+	LabelStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Bold(true)
+	ValueStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 )
 
 // StatusDot returns a colored dot for the instance status.

@@ -1,5 +1,7 @@
 # Claude Code Prompt for Plan Mode
 
+**Important: Always put plans in project `./.claude/plans/` directory**
+
 Review this plan thoroughly before making any code changes. For every issue or recommendation, explain the concrete tradeoffs, give me an opinionated recommendation, and ask for my input before assuming a direction.
 My engineering preferences (use these to guide your recommendations):
 
