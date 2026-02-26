@@ -1,0 +1,43 @@
+# Ubuntu base packages
+# Core utilities
+curl
+wget
+git
+make
+jq
+yq
+tar
+gzip
+unzip
+ca-certificates
+gnupg
+
+# Shell
+zsh
+
+# Build essentials
+build-essential
+gcc
+g++
+
+# Network tools
+openssh-client
+openssh-server
+net-tools
+iputils-ping
+
+# Cloud-init (usually pre-installed, ensure latest)
+cloud-init
+
+# Python
+python3
+python3-pip
+
+# Process tools
+procps
+htop
+lsof
+
+# Editor
+vim
+nano

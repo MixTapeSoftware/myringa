@@ -3,12 +3,15 @@ package incus
 import (
 	"context"
 	"fmt"
+	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	incusclient "github.com/lxc/incus/v6/client"
 	"github.com/lxc/incus/v6/shared/api"
+	"gopkg.in/yaml.v2"
 
 	"myringa/internal/format"
 )
@@ -46,8 +49,9 @@ type CPUSnapshot struct {
 	Timestamp time.Time
 }
 
-// Client is the interface for all Incus operations the UI needs.
+// Client is the interface for all Incus operations.
 type Client interface {
+	// UI operations
 	FetchInstances(ctx context.Context, prev map[string]CPUSnapshot) ([]InstanceRow, map[string]CPUSnapshot, error)
 	StartInstance(ctx context.Context, name string) error
 	StopInstance(ctx context.Context, name string) error
@@ -60,6 +64,21 @@ type Client interface {
 	ListImages(ctx context.Context) ([]ImageInfo, error)
 	ListProfiles(ctx context.Context) ([]ProfileInfo, error)
 	CreateInstance(ctx context.Context, name, imageAlias, profile string) error
+
+	// Provisioning operations
+	ProfileExists(ctx context.Context, name string) (bool, error)
+	CreateProfile(ctx context.Context, name string, yamlData string) error
+	ImageAliasExists(ctx context.Context, alias string) (bool, error)
+	DeleteImageAlias(ctx context.Context, alias string) error
+	// LaunchBuilder creates and starts an instance from a remote image source.
+	// Used by the image builder; server is a full URL, protocol is "simplestreams".
+	LaunchBuilder(ctx context.Context, name, server, protocol, alias string) error
+	ExecStream(ctx context.Context, name string, cmd []string, stdout, stderr io.Writer) error
+	PublishInstance(ctx context.Context, name, alias string) error
+	CreateInstanceFull(ctx context.Context, req api.InstancesPost) error
+	UpdateInstanceConfig(ctx context.Context, name string, config map[string]string) error
+	AddDevice(ctx context.Context, instanceName, deviceName string, device map[string]string) error
+	ExecInstance(ctx context.Context, instanceName string, cmd []string) ([]byte, error)
 }
 
 // client implements Client using the Incus SDK over a local Unix socket.
@@ -117,6 +136,9 @@ func (c *client) FetchInstances(_ context.Context, prev map[string]CPUSnapshot) 
 				elapsed := now.Sub(p.Timestamp).Seconds()
 				if deltaNS >= 0 && elapsed > 0 {
 					pct := float64(deltaNS) / (elapsed * 1e9) * 100
+					if cores, ok := parseCPULimit(row.CPULimit); ok {
+						pct /= cores
+					}
 					row.CPU = fmt.Sprintf("%.1f%%", pct)
 				}
 			}
@@ -283,6 +305,198 @@ func (c *client) ListSnapshots(_ context.Context, instanceName string) ([]Snapsh
 	return result, nil
 }
 
+func (c *client) ProfileExists(_ context.Context, name string) (bool, error) {
+	profiles, err := c.conn.GetProfileNames()
+	if err != nil {
+		return false, err
+	}
+	for _, p := range profiles {
+		if p == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (c *client) ImageAliasExists(_ context.Context, alias string) (bool, error) {
+	_, _, err := c.conn.GetImageAlias(alias)
+	if err != nil {
+		// Incus returns a 404-style error when the alias doesn't exist.
+		if isNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (c *client) DeleteImageAlias(_ context.Context, alias string) error {
+	return c.conn.DeleteImageAlias(alias)
+}
+
+func (c *client) CreateProfile(_ context.Context, name string, yamlData string) error {
+	var req api.ProfilesPost
+	req.Name = name
+	// Parse YAML into profile config/devices via api types.
+	// We use the Incus API's profile YAML format directly.
+	var profilePut api.ProfilePut
+	if err := parseProfileYAML(yamlData, &profilePut); err != nil {
+		return fmt.Errorf("parsing profile YAML: %w", err)
+	}
+	req.ProfilePut = profilePut
+	return c.conn.CreateProfile(req)
+}
+
+func (c *client) CreateInstanceFull(ctx context.Context, req api.InstancesPost) error {
+	op, err := c.conn.CreateInstance(req)
+	if err != nil {
+		return err
+	}
+	return op.WaitContext(ctx)
+}
+
+func (c *client) UpdateInstanceConfig(ctx context.Context, name string, config map[string]string) error {
+	inst, etag, err := c.conn.GetInstance(name)
+	if err != nil {
+		return err
+	}
+	if inst.Config == nil {
+		inst.Config = make(map[string]string)
+	}
+	for k, v := range config {
+		inst.Config[k] = v
+	}
+	op, err := c.conn.UpdateInstance(name, inst.InstancePut, etag)
+	if err != nil {
+		return err
+	}
+	return op.WaitContext(ctx)
+}
+
+func (c *client) AddDevice(ctx context.Context, instanceName, deviceName string, device map[string]string) error {
+	inst, etag, err := c.conn.GetInstance(instanceName)
+	if err != nil {
+		return err
+	}
+	if inst.Devices == nil {
+		inst.Devices = make(map[string]map[string]string)
+	}
+	inst.Devices[deviceName] = device
+	op, err := c.conn.UpdateInstance(instanceName, inst.InstancePut, etag)
+	if err != nil {
+		return err
+	}
+	return op.WaitContext(ctx)
+}
+
+func (c *client) ExecInstance(_ context.Context, instanceName string, cmd []string) ([]byte, error) {
+	var stdout, stderr strings.Builder
+	execReq := api.InstanceExecPost{
+		Command:   cmd,
+		WaitForWS: false,
+	}
+	args := incusclient.InstanceExecArgs{
+		Stdout: &stringWriter{&stdout},
+		Stderr: &stringWriter{&stderr},
+	}
+	op, err := c.conn.ExecInstance(instanceName, execReq, &args)
+	if err != nil {
+		return nil, err
+	}
+	if err := op.Wait(); err != nil {
+		return nil, err
+	}
+	return []byte(stdout.String()), nil
+}
+
+func (c *client) LaunchBuilder(ctx context.Context, name, server, protocol, alias string) error {
+	req := api.InstancesPost{
+		Name: name,
+		Source: api.InstanceSource{
+			Type:     "image",
+			Server:   server,
+			Protocol: protocol,
+			Alias:    alias,
+		},
+		InstancePut: api.InstancePut{
+			Profiles: []string{"default"},
+		},
+	}
+	op, err := c.conn.CreateInstance(req)
+	if err != nil {
+		return err
+	}
+	if err := op.WaitContext(ctx); err != nil {
+		return err
+	}
+	return c.StartInstance(ctx, name)
+}
+
+func (c *client) ExecStream(_ context.Context, name string, cmd []string, stdout, stderr io.Writer) error {
+	req := api.InstanceExecPost{
+		Command:   cmd,
+		WaitForWS: false,
+	}
+	args := &incusclient.InstanceExecArgs{
+		Stdout: stdout,
+		Stderr: stderr,
+	}
+	op, err := c.conn.ExecInstance(name, req, args)
+	if err != nil {
+		return err
+	}
+	return op.Wait()
+}
+
+func (c *client) PublishInstance(ctx context.Context, name, alias string) error {
+	req := api.ImagesPost{
+		Source: &api.ImagesPostSource{
+			Type: "instance",
+			Name: name,
+		},
+		Aliases: []api.ImageAlias{{Name: alias}},
+	}
+	op, err := c.conn.CreateImage(req, nil)
+	if err != nil {
+		return err
+	}
+	return op.WaitContext(ctx)
+}
+
+// stringWriter adapts strings.Builder to io.Writer.
+type stringWriter struct{ b *strings.Builder }
+
+func (w *stringWriter) Write(p []byte) (int, error) {
+	return w.b.Write(p)
+}
+
+// isNotFound reports whether an Incus SDK error is a 404 / not-found response.
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "not found") || strings.Contains(s, "404")
+}
+
+// parseProfileYAML parses a myringa profile YAML into an api.ProfilePut.
+// Our YAML format mirrors the Incus profile format: config: {} and devices: {}.
+func parseProfileYAML(data string, out *api.ProfilePut) error {
+	// Use gopkg.in/yaml.v2 compatible intermediate struct.
+	var raw struct {
+		Description string                       `yaml:"description"`
+		Config      map[string]string            `yaml:"config"`
+		Devices     map[string]map[string]string `yaml:"devices"`
+	}
+	if err := yaml.Unmarshal([]byte(data), &raw); err != nil {
+		return err
+	}
+	out.Description = raw.Description
+	out.Config = raw.Config
+	out.Devices = raw.Devices
+	return nil
+}
+
 // Unexported helpers
 
 func allIPv4(networks map[string]api.InstanceStateNetwork) string {
@@ -321,6 +535,28 @@ func rootDiskUsage(disks map[string]api.InstanceStateDisk) string {
 		return format.Bytes(total)
 	}
 	return "—"
+}
+
+// parseCPULimit parses an Incus limits.cpu value into a core count.
+// Accepts an integer ("4") or a CPU range ("0-3"). Returns false if
+// the value is empty or cannot be parsed.
+func parseCPULimit(s string) (float64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	if i := strings.Index(s, "-"); i >= 0 {
+		lo, err1 := strconv.Atoi(s[:i])
+		hi, err2 := strconv.Atoi(s[i+1:])
+		if err1 != nil || err2 != nil || hi < lo {
+			return 0, false
+		}
+		return float64(hi-lo+1), true
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return float64(n), true
 }
 
 func instanceType(t string) string {

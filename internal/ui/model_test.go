@@ -3,10 +3,12 @@ package ui
 import (
 	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/lxc/incus/v6/shared/api"
 
 	"myringa/internal/incus"
 )
@@ -90,6 +92,50 @@ func (m *mockClient) ListProfiles(_ context.Context) ([]incus.ProfileInfo, error
 func (m *mockClient) CreateInstance(_ context.Context, name, image, profile string) error {
 	m.record("CreateInstance:" + name)
 	return m.actionErr
+}
+
+func (m *mockClient) ProfileExists(_ context.Context, name string) (bool, error) {
+	return false, nil
+}
+
+func (m *mockClient) ImageAliasExists(_ context.Context, _ string) (bool, error) {
+	return true, nil
+}
+
+func (m *mockClient) DeleteImageAlias(_ context.Context, _ string) error {
+	return nil
+}
+
+func (m *mockClient) LaunchBuilder(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
+
+func (m *mockClient) ExecStream(_ context.Context, _ string, _ []string, _, _ io.Writer) error {
+	return nil
+}
+
+func (m *mockClient) PublishInstance(_ context.Context, _, _ string) error {
+	return nil
+}
+
+func (m *mockClient) CreateProfile(_ context.Context, name string, _ string) error {
+	return nil
+}
+
+func (m *mockClient) CreateInstanceFull(_ context.Context, _ api.InstancesPost) error {
+	return nil
+}
+
+func (m *mockClient) UpdateInstanceConfig(_ context.Context, _ string, _ map[string]string) error {
+	return nil
+}
+
+func (m *mockClient) AddDevice(_ context.Context, _, _ string, _ map[string]string) error {
+	return nil
+}
+
+func (m *mockClient) ExecInstance(_ context.Context, _ string, _ []string) ([]byte, error) {
+	return nil, nil
 }
 
 // --- Test Helpers ---
