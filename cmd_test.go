@@ -5,21 +5,21 @@ import (
 )
 
 func TestSubcommandRoute_NoArgs_RunsTUI(t *testing.T) {
-	cmd, _ := parseArgs([]string{"myringa"})
+	cmd, _ := parseArgs([]string{"ring"})
 	if cmd != cmdTUI {
 		t.Errorf("no args: expected cmdTUI, got %v", cmd)
 	}
 }
 
 func TestSubcommandRoute_LaunchSubcommand(t *testing.T) {
-	cmd, _ := parseArgs([]string{"myringa", "launch", "mydev"})
+	cmd, _ := parseArgs([]string{"ring", "launch", "mydev"})
 	if cmd != cmdLaunch {
 		t.Errorf("launch subcommand: expected cmdLaunch, got %v", cmd)
 	}
 }
 
 func TestSubcommandRoute_UnknownSubcommand(t *testing.T) {
-	cmd, _ := parseArgs([]string{"myringa", "unknown"})
+	cmd, _ := parseArgs([]string{"ring", "unknown"})
 	if cmd != cmdUnknown {
 		t.Errorf("unknown subcommand: expected cmdUnknown, got %v", cmd)
 	}

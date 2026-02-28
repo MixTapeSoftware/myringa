@@ -1,4 +1,4 @@
-# myringa
+# ring
 
 Built with [Claude Code](https://claude.ai/claude-code) and Sonnet 4.6 + Opus 4.6 (Anthropic).
 
@@ -12,7 +12,7 @@ A terminal dashboard and provisioning CLI for [Incus](https://linuxcontainers.or
 
 ## Why
 
-Incus is a powerful system with a lot of features. Myringa is a subset of that functionality shaped to support secure local development with incus.
+Incus is a powerful system with a lot of features. Ring is a subset of that functionality shaped to support secure local development with incus.
 
 ## Requirements
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# build.sh — Build and publish myringa custom Incus images.
+# build.sh — Build and publish ring custom Incus images.
 #
 # Usage: ./build.sh <alpine|ubuntu> [--dev] [--tag <tag>]
 #
 # Examples:
-#   ./build.sh alpine                 # build myringa/alpine:latest
-#   ./build.sh ubuntu --dev           # build myringa/ubuntu-dev:latest
-#   ./build.sh alpine --dev --tag v2  # build myringa/alpine-dev:v2
+#   ./build.sh alpine                 # build ring/alpine:latest
+#   ./build.sh ubuntu --dev           # build ring/ubuntu-dev:latest
+#   ./build.sh alpine --dev --tag v2  # build ring/alpine-dev:v2
 
 set -euo pipefail
 
@@ -34,13 +34,13 @@ fi
 # ── Config ────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILDER_NAME="myringa-builder-$$"
+BUILDER_NAME="ring-builder-$$"
 
 if [[ "$DEV" == "true" ]]; then
-  ALIAS="myringa/${DISTRO}-dev:${TAG}"
+  ALIAS="ring/${DISTRO}-dev:${TAG}"
   VARIANT="${DISTRO}-dev"
 else
-  ALIAS="myringa/${DISTRO}:${TAG}"
+  ALIAS="ring/${DISTRO}:${TAG}"
   VARIANT="${DISTRO}"
 fi
 

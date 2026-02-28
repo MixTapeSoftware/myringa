@@ -102,7 +102,7 @@ func LoadPackages(distro string) ([]string, error) {
 	return pkgs, nil
 }
 
-// Build builds a myringa custom image and publishes it to the local Incus store.
+// Build builds a ring custom image and publishes it to the local Incus store.
 // Progress is written to out. This is a blocking operation (~2-5 minutes).
 func Build(ctx context.Context, c BuildClient, opts BuildOpts, out io.Writer) error {
 	if err := opts.Validate(); err != nil {

@@ -1,7 +1,7 @@
 config:
   limits.cpu: "4"
   limits.memory: 4GiB
-description: Base myringa dev environment
+description: Base ring dev environment
 devices:
   root:
     type: disk
