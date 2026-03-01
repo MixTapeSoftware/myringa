@@ -1,7 +1,0 @@
-config:
-  security.nesting: "true"
-  security.syscalls.intercept.mknod: "true"
-  security.syscalls.intercept.setxattr: "true"
-  raw.lxc: lxc.apparmor.profile=unconfined
-description: Docker-in-Incus support (requires AppArmor unconfined)
-devices: {}
