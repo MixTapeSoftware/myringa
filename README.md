@@ -101,6 +101,7 @@ ring launch <name> [flags]
 | `--proxy` | — | HTTP proxy as `host:port` (sets `HTTP_PROXY` / `HTTPS_PROXY`) |
 | `--workspace` | cwd | Host directory to bind-mount |
 | `--mount-path` | `/workspace` | Container mount point |
+| `--gh-token` | off | Configure GitHub CLI + git auth (prompts for PAT and git identity) |
 | `--dry-run` | off | Show what would be done without making changes |
 
 ### Examples
@@ -114,6 +115,9 @@ ring launch mydev --distro ubuntu
 
 # Mount a specific workspace directory
 ring launch mydev --workspace ~/projects/myapp
+
+# Configure GitHub auth (prompts for PAT + git identity)
+ring launch mydev --gh-token
 
 # Preview what would be created
 ring launch mydev --distro ubuntu --dry-run
