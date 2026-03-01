@@ -137,24 +137,7 @@ func Build(ctx context.Context, c BuildClient, opts BuildOpts, out io.Writer) er
 		return fmt.Errorf("installing packages: %w", err)
 	}
 
-	// Step 3: Enable cloud-init services (Alpine only — Ubuntu enables them via systemd on install).
-	if opts.Distro == "alpine" {
-		fmt.Fprintf(out, "Enabling cloud-init services...\n")
-		// cloud-init-local must be in sysinit; the rest run in default.
-		cloudInitSvcs := []struct{ svc, runlevel string }{
-			{"cloud-init-local", "sysinit"},
-			{"cloud-init", "default"},
-			{"cloud-config", "default"},
-			{"cloud-final", "default"},
-		}
-		for _, s := range cloudInitSvcs {
-			if err := c.ExecStream(ctx, builder, []string{"rc-update", "add", s.svc, s.runlevel}, out, out); err != nil {
-				return fmt.Errorf("enabling cloud-init service %s: %w", s.svc, err)
-			}
-		}
-	}
-
-	// Step 4: Install mise.
+	// Step 3: Install mise.
 	fmt.Fprintf(out, "Installing mise...\n")
 	if err := c.ExecStream(ctx, builder, []string{"sh", "-c",
 		"curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh",
@@ -174,7 +157,7 @@ func Build(ctx context.Context, c BuildClient, opts BuildOpts, out io.Writer) er
 		}
 	}
 
-	// Step 5: Dev tools (oh-my-zsh, fzf, bat, neovim, docker) — always installed.
+	// Step 5: Dev tools (oh-my-zsh, fzf, bat, neovim, docker).
 	if err := installDevTools(ctx, c, builder, opts.Distro, out); err != nil {
 		return fmt.Errorf("installing dev tools: %w", err)
 	}
@@ -211,13 +194,13 @@ func Build(ctx context.Context, c BuildClient, opts BuildOpts, out io.Writer) er
 		return fmt.Errorf("installing claude to /usr/local/bin: %w", err)
 	}
 
-	// Step 7: Stop builder.
+	// Step 6: Stop builder.
 	fmt.Fprintf(out, "Stopping builder...\n")
 	if err := c.StopInstance(ctx, builder); err != nil {
 		return fmt.Errorf("stopping builder: %w", err)
 	}
 
-	// Step 8: Publish (replacing any existing image with the same alias).
+	// Step 7: Publish (replacing any existing image with the same alias).
 	fmt.Fprintf(out, "Publishing locally as %s...\n", alias)
 	if exists, err := c.ImageAliasExists(ctx, alias); err != nil {
 		return fmt.Errorf("checking existing image: %w", err)

@@ -264,7 +264,7 @@ func DryRun(_ context.Context, opts LaunchOpts) (string, error) {
 }
 
 // provisionUser creates the dev user and configures their environment
-// synchronously after the container starts — no cloud-init required.
+// synchronously after the container starts.
 func provisionUser(ctx context.Context, c Client, opts LaunchOpts) error {
 	name := opts.Name
 	u := opts.Username

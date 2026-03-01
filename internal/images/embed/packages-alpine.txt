@@ -13,7 +13,6 @@
 bash
 build-base
 gcompat
-cloud-init
 curl
 doas
 git

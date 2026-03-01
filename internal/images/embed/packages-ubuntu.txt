@@ -1,6 +1,5 @@
 build-essential
 ca-certificates
-cloud-init
 curl
 g++
 gcc

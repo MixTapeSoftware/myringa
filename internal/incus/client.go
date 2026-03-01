@@ -21,8 +21,8 @@ import (
 // InstanceRow holds formatted data for a single instance.
 type InstanceRow struct {
 	Name, Type, Status, CPU, Memory, Disk, IPv4 string
-	CPULimit    string
-	MemoryLimit string
+	CPULimit                                    string
+	MemoryLimit                                 string
 }
 
 // SnapshotInfo holds summary data for an instance snapshot.
@@ -600,7 +600,7 @@ func parseCPULimit(s string) (float64, bool) {
 		if err1 != nil || err2 != nil || hi < lo {
 			return 0, false
 		}
-		return float64(hi-lo+1), true
+		return float64(hi - lo + 1), true
 	}
 	n, err := strconv.Atoi(s)
 	if err != nil || n <= 0 {
