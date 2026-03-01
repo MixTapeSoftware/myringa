@@ -19,6 +19,7 @@ type mockClient struct {
 	instanceConfigs  map[string]map[string]string
 	instanceDevices  map[string]map[string]map[string]string
 	startedInstances []string
+	startCallCount   int
 	writtenFiles     map[string][]byte
 
 	// Configurable errors
@@ -26,7 +27,9 @@ type mockClient struct {
 	createInstanceFullErr error
 	updateConfigErr       error
 	addDeviceErr          error
-	startErr              error
+	shiftUnsupported      bool  // if true, AddDevice fails when device has shift=true
+	startErr              error // returned on every StartInstance call
+	startIdmapErrOnFirst  bool  // if true, first StartInstance returns an idmapping error
 	writeFileErr          error
 	execResults           map[string]execResult
 }
@@ -86,6 +89,9 @@ func (m *mockClient) UpdateInstanceConfig(_ context.Context, name string, config
 }
 
 func (m *mockClient) AddDevice(_ context.Context, instanceName, deviceName string, device map[string]string) error {
+	if m.shiftUnsupported && device["shift"] == "true" {
+		return errors.New("shift=true not supported on this host")
+	}
 	if m.addDeviceErr != nil {
 		return m.addDeviceErr
 	}
@@ -97,6 +103,10 @@ func (m *mockClient) AddDevice(_ context.Context, instanceName, deviceName strin
 }
 
 func (m *mockClient) StartInstance(_ context.Context, name string) error {
+	m.startCallCount++
+	if m.startIdmapErrOnFirst && m.startCallCount == 1 {
+		return errors.New("Failed to setup device mount: idmapping abilities are required but aren't supported on system")
+	}
 	if m.startErr != nil {
 		return m.startErr
 	}
@@ -341,45 +351,10 @@ func TestValidate_AcceptsValidProxy(t *testing.T) {
 	}
 }
 
-func TestValidate_RejectsDockerWithoutDevTools(t *testing.T) {
-	opts := provision.LaunchOpts{
-		Name:      "mydev",
-		Distro:    "alpine",
-		Username:  "chad",
-		UID:       1000,
-		GID:       1000,
-		Workspace: "/home/chad/project",
-		MountPath: "/workspace",
-		Docker:    true,
-		DevTools:  false,
-		Sudo:      true,
-	}
-	if err := opts.Validate(); err == nil {
-		t.Error("expected error: Docker=true requires DevTools=true (Docker is baked into -dev images)")
-	}
-}
-
-func TestValidate_AcceptsDockerWithDevTools(t *testing.T) {
-	opts := provision.LaunchOpts{
-		Name:      "mydev",
-		Distro:    "alpine",
-		Username:  "chad",
-		UID:       1000,
-		GID:       1000,
-		Workspace: "/home/chad/project",
-		MountPath: "/workspace",
-		Docker:    true,
-		DevTools:  true,
-		Sudo:      true,
-	}
-	if err := opts.Validate(); err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
 
 // ── Image alias resolution ─────────────────────────────────────────────────────
 
-func TestImageAlias_NoDevTools(t *testing.T) {
+func TestImageAlias(t *testing.T) {
 	cases := []struct {
 		distro string
 		want   string
@@ -388,25 +363,9 @@ func TestImageAlias_NoDevTools(t *testing.T) {
 		{"ubuntu", "ring/ubuntu:latest"},
 	}
 	for _, c := range cases {
-		got := provision.ImageAlias(c.distro, false)
+		got := provision.ImageAlias(c.distro)
 		if got != c.want {
-			t.Errorf("distro=%q devtools=false: got %q, want %q", c.distro, got, c.want)
-		}
-	}
-}
-
-func TestImageAlias_WithDevTools(t *testing.T) {
-	cases := []struct {
-		distro string
-		want   string
-	}{
-		{"alpine", "ring/alpine-dev:latest"},
-		{"ubuntu", "ring/ubuntu-dev:latest"},
-	}
-	for _, c := range cases {
-		got := provision.ImageAlias(c.distro, true)
-		if got != c.want {
-			t.Errorf("distro=%q devtools=true: got %q, want %q", c.distro, got, c.want)
+			t.Errorf("distro=%q: got %q, want %q", c.distro, got, c.want)
 		}
 	}
 }
@@ -463,21 +422,8 @@ func TestSyncProfiles_PartiallyMissing(t *testing.T) {
 
 // ── Profile list assembly ─────────────────────────────────────────────────────
 
-func TestBuildProfiles_NoDocker(t *testing.T) {
-	got := provision.BuildProfiles(false)
-	want := []string{"default", "ring-base"}
-	if len(got) != len(want) {
-		t.Fatalf("got %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("[%d] got %q, want %q", i, got[i], want[i])
-		}
-	}
-}
-
-func TestBuildProfiles_WithDocker(t *testing.T) {
-	got := provision.BuildProfiles(true)
+func TestBuildProfiles(t *testing.T) {
+	got := provision.BuildProfiles()
 	want := []string{"default", "ring-base", "ring-docker"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -547,28 +493,23 @@ func TestLaunch_SyncsProfiles(t *testing.T) {
 
 func TestLaunch_UsesCorrectImageAlias(t *testing.T) {
 	cases := []struct {
-		distro   string
-		devTools bool
-		want     string
+		distro string
+		want   string
 	}{
-		{"alpine", false, "ring/alpine:latest"},
-		{"ubuntu", false, "ring/ubuntu:latest"},
-		{"alpine", true, "ring/alpine-dev:latest"},
-		{"ubuntu", true, "ring/ubuntu-dev:latest"},
+		{"alpine", "ring/alpine:latest"},
+		{"ubuntu", "ring/ubuntu:latest"},
 	}
 
 	for _, c := range cases {
 		mc := newMockClient()
 		opts := baseOpts()
 		opts.Distro = c.distro
-		opts.DevTools = c.devTools
 
 		if err := provision.Launch(context.Background(), mc, opts, io.Discard); err != nil {
-			t.Fatalf("distro=%q dev=%v: Launch failed: %v", c.distro, c.devTools, err)
+			t.Fatalf("distro=%q: Launch failed: %v", c.distro, err)
 		}
 		if mc.lastImageAlias != c.want {
-			t.Errorf("distro=%q dev=%v: image alias = %q, want %q",
-				c.distro, c.devTools, mc.lastImageAlias, c.want)
+			t.Errorf("distro=%q: image alias = %q, want %q", c.distro, mc.lastImageAlias, c.want)
 		}
 	}
 }
@@ -646,21 +587,18 @@ func TestLaunch_NoSudoers_WhenSudoDisabled(t *testing.T) {
 	}
 }
 
-func TestLaunch_MountsWorkspace(t *testing.T) {
+func TestLaunch_MountsWorkspace_ShiftTrue(t *testing.T) {
+	// Default: shift=true is supported; device should have shift=true set.
 	mc := newMockClient()
-	ctx := context.Background()
-
-	if err := provision.Launch(ctx, mc, baseOpts(), io.Discard); err != nil {
+	if err := provision.Launch(context.Background(), mc, baseOpts(), io.Discard); err != nil {
 		t.Fatalf("Launch failed: %v", err)
 	}
-
-	devs := mc.instanceDevices["mydev"]
-	if devs == nil {
-		t.Fatal("no devices added to mydev")
+	ws := mc.instanceDevices["mydev"]["workspace"]
+	if ws == nil {
+		t.Fatal("workspace device not added")
 	}
-	ws, ok := devs["workspace"]
-	if !ok {
-		t.Error("workspace device not added")
+	if ws["shift"] != "true" {
+		t.Errorf("expected shift=true on workspace device, got %q", ws["shift"])
 	}
 	if ws["source"] != "/home/chad/project" {
 		t.Errorf("workspace source: got %q, want /home/chad/project", ws["source"])
@@ -670,37 +608,69 @@ func TestLaunch_MountsWorkspace(t *testing.T) {
 	}
 }
 
-func TestLaunch_SetsIdmap(t *testing.T) {
+func TestLaunch_ShiftTrue_SkipsIdmap(t *testing.T) {
+	// When shift=true succeeds, raw.idmap must NOT be set.
 	mc := newMockClient()
-	ctx := context.Background()
-
 	opts := baseOpts()
 	opts.UID = 1234
 	opts.GID = 5678
-
-	if err := provision.Launch(ctx, mc, opts, io.Discard); err != nil {
+	if err := provision.Launch(context.Background(), mc, opts, io.Discard); err != nil {
 		t.Fatalf("Launch failed: %v", err)
 	}
-
-	cfg := mc.instanceConfigs["mydev"]
-	idmap, ok := cfg["raw.idmap"]
-	if !ok {
-		t.Error("raw.idmap must be set when idmap succeeds")
+	if _, ok := mc.instanceConfigs["mydev"]["raw.idmap"]; ok {
+		t.Error("raw.idmap must not be set when shift=true succeeds")
 	}
+}
+
+func TestLaunch_ShiftFallback_SetsIdmap(t *testing.T) {
+	// When shift=true fails, fall back to raw.idmap.
+	mc := newMockClient()
+	mc.shiftUnsupported = true
+	opts := baseOpts()
+	opts.UID = 1234
+	opts.GID = 5678
+	if err := provision.Launch(context.Background(), mc, opts, io.Discard); err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	idmap := mc.instanceConfigs["mydev"]["raw.idmap"]
 	if idmap != "both 1234 5678" {
 		t.Errorf("raw.idmap: got %q, want %q", idmap, "both 1234 5678")
+	}
+	// Device must be present without shift.
+	ws := mc.instanceDevices["mydev"]["workspace"]
+	if ws["shift"] == "true" {
+		t.Error("device must not have shift=true when falling back to raw.idmap")
 	}
 }
 
 func TestLaunch_IdmapFallback_NoError(t *testing.T) {
+	// shift=true fails AND raw.idmap fails — launch still succeeds with a warning.
 	mc := newMockClient()
+	mc.shiftUnsupported = true
 	mc.updateConfigErr = errors.New("idmap not supported")
-	ctx := context.Background()
+	if err := provision.Launch(context.Background(), mc, baseOpts(), io.Discard); err != nil {
+		t.Fatalf("Launch must succeed even when both shift and idmap fail: %v", err)
+	}
+}
 
-	// Launch should succeed even when idmap fails (fallback path).
-	// The warning is logged but not returned as an error.
-	if err := provision.Launch(ctx, mc, baseOpts(), io.Discard); err != nil {
-		t.Fatalf("Launch must succeed even on idmap failure (fallback): %v", err)
+func TestLaunch_IdmapStartFails_FallsBackToPrivileged(t *testing.T) {
+	// shift=true fails → raw.idmap set → StartInstance fails with idmap error →
+	// security.privileged=true set, raw.idmap cleared → second StartInstance succeeds.
+	mc := newMockClient()
+	mc.shiftUnsupported = true
+	mc.startIdmapErrOnFirst = true
+	if err := provision.Launch(context.Background(), mc, baseOpts(), io.Discard); err != nil {
+		t.Fatalf("Launch must succeed after privileged fallback: %v", err)
+	}
+	if mc.startCallCount != 2 {
+		t.Errorf("expected 2 StartInstance calls (first fails, retry succeeds), got %d", mc.startCallCount)
+	}
+	cfg := mc.instanceConfigs["mydev"]
+	if cfg["security.privileged"] != "true" {
+		t.Errorf("security.privileged must be set after idmap start failure, got %q", cfg["security.privileged"])
+	}
+	if cfg["raw.idmap"] != "" {
+		t.Errorf("raw.idmap must be cleared after idmap start failure, got %q", cfg["raw.idmap"])
 	}
 }
 
@@ -795,20 +765,16 @@ func TestLaunch_DryRun_DoesNothing(t *testing.T) {
 	}
 }
 
-func TestLaunch_WithDocker_DockerProfileIncluded(t *testing.T) {
+func TestLaunch_DockerProfileAlwaysIncluded(t *testing.T) {
 	mc := newMockClient()
 	ctx := context.Background()
 
-	opts := baseOpts()
-	opts.Docker = true
-	opts.DevTools = true
-
-	if err := provision.Launch(ctx, mc, opts, io.Discard); err != nil {
+	if err := provision.Launch(ctx, mc, baseOpts(), io.Discard); err != nil {
 		t.Fatalf("Launch failed: %v", err)
 	}
 
 	if !mc.profiles["ring-docker"] {
-		t.Error("ring-docker profile must be synced when Docker=true")
+		t.Error("ring-docker profile must always be synced")
 	}
 }
 

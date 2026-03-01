@@ -17,9 +17,8 @@ var profilesFS embed.FS
 // ErrImageNotFound is returned by Launch when the required local image alias
 // doesn't exist. The caller can use this to trigger an auto-build.
 type ErrImageNotFound struct {
-	Alias    string
-	Distro   string
-	DevTools bool
+	Alias  string
+	Distro string
 }
 
 func (e *ErrImageNotFound) Error() string {
@@ -52,8 +51,6 @@ type InstanceRequest struct {
 type LaunchOpts struct {
 	Name      string // required; [a-zA-Z0-9][a-zA-Z0-9-]*
 	Distro    string // "alpine" or "ubuntu"
-	Docker    bool   // requires DevTools=true
-	DevTools  bool   // selects the -dev image variant
 	Sudo      bool   // NOPASSWD sudo (default: true)
 	Proxy     string // "host:port" or empty
 	Workspace string // absolute host path (default: cwd)
@@ -94,27 +91,18 @@ func (o LaunchOpts) Validate() error {
 	if o.Proxy != "" && !proxyRe.MatchString(o.Proxy) {
 		return fmt.Errorf("Proxy %q is invalid: must be host:port (no scheme)", o.Proxy)
 	}
-	if o.Docker && !o.DevTools {
-		return fmt.Errorf("Docker=true requires DevTools=true: Docker packages are baked into -dev images")
-	}
 	return nil
 }
 
 // ImageAlias resolves the local Incus image alias.
-func ImageAlias(distro string, devTools bool) string {
-	if devTools {
-		return fmt.Sprintf("ring/%s-dev:latest", distro)
-	}
+func ImageAlias(distro string) string {
 	return fmt.Sprintf("ring/%s:latest", distro)
 }
 
 // BuildProfiles returns the ordered profile list for a new instance.
-func BuildProfiles(docker bool) []string {
-	profiles := []string{"default", "ring-base"}
-	if docker {
-		profiles = append(profiles, "ring-docker")
-	}
-	return profiles
+// ring-docker is always included — all ring containers run with Docker support.
+func BuildProfiles() []string {
+	return []string{"default", "ring-base", "ring-docker"}
 }
 
 // WorkspaceDevice returns an Incus device map for a workspace disk mount.
@@ -123,6 +111,17 @@ func WorkspaceDevice(hostPath, containerPath string) map[string]string {
 		"type":   "disk",
 		"source": hostPath,
 		"path":   containerPath,
+	}
+}
+
+// WorkspaceDeviceWithShift returns a workspace device map with shift=true,
+// which uses kernel-level idmapped mounts (Linux 5.12+, no subuid/subgid required).
+func WorkspaceDeviceWithShift(hostPath, containerPath string) map[string]string {
+	return map[string]string{
+		"type":   "disk",
+		"source": hostPath,
+		"path":   containerPath,
+		"shift":  "true",
 	}
 }
 
@@ -177,14 +176,14 @@ func Launch(ctx context.Context, c Client, opts LaunchOpts, out io.Writer) error
 		return fmt.Errorf("syncing profiles: %w", err)
 	}
 
-	imageAlias := ImageAlias(opts.Distro, opts.DevTools)
+	imageAlias := ImageAlias(opts.Distro)
 
 	exists, err := c.ImageAliasExists(ctx, imageAlias)
 	if err != nil {
 		return fmt.Errorf("checking image alias: %w", err)
 	}
 	if !exists {
-		return &ErrImageNotFound{Alias: imageAlias, Distro: opts.Distro, DevTools: opts.DevTools}
+		return &ErrImageNotFound{Alias: imageAlias, Distro: opts.Distro}
 	}
 
 	config := map[string]string{}
@@ -197,28 +196,44 @@ func Launch(ctx context.Context, c Client, opts LaunchOpts, out io.Writer) error
 	req := InstanceRequest{
 		Name:       opts.Name,
 		ImageAlias: imageAlias,
-		Profiles:   BuildProfiles(opts.Docker),
+		Profiles:   BuildProfiles(),
 		Config:     config,
 	}
 	if err := c.CreateInstanceFull(ctx, req); err != nil {
 		return fmt.Errorf("creating instance: %w", err)
 	}
 
-	// Idmap negotiation: try raw.idmap, fall back silently if unsupported.
-	idmapErr := c.UpdateInstanceConfig(ctx, opts.Name, map[string]string{
-		"raw.idmap": fmt.Sprintf("both %d %d", opts.UID, opts.GID),
-	})
-	if idmapErr != nil {
-		fmt.Fprintf(out, "WARNING: raw.idmap not supported on this host — workspace files may appear owned by root inside the container (%v)\n", idmapErr)
-	}
-
-	device := WorkspaceDevice(opts.Workspace, opts.MountPath)
-	if err := c.AddDevice(ctx, opts.Name, "workspace", device); err != nil {
-		return fmt.Errorf("adding workspace device: %w", err)
+	// Workspace mount strategy (try best option, degrade gracefully):
+	//   1. shift=true  — kernel idmapped mounts (Linux 5.12+); cleanest, no subuid/subgid needed.
+	//   2. raw.idmap   — AddDevice succeeds but StartInstance may still fail on older kernels.
+	//   3. plain mount — no UID mapping; workspace files appear owned by root inside container.
+	if err := c.AddDevice(ctx, opts.Name, "workspace", WorkspaceDeviceWithShift(opts.Workspace, opts.MountPath)); err != nil {
+		// shift=true not supported; try raw.idmap + plain device.
+		_ = c.UpdateInstanceConfig(ctx, opts.Name, map[string]string{
+			"raw.idmap": fmt.Sprintf("both %d %d", opts.UID, opts.GID),
+		})
+		if addErr := c.AddDevice(ctx, opts.Name, "workspace", WorkspaceDevice(opts.Workspace, opts.MountPath)); addErr != nil {
+			return fmt.Errorf("adding workspace device: %w", addErr)
+		}
 	}
 
 	if err := c.StartInstance(ctx, opts.Name); err != nil {
-		return fmt.Errorf("starting instance: %w", err)
+		if strings.Contains(err.Error(), "idmap") {
+			// Kernel doesn't support idmapped mounts. Fall back to a privileged container:
+			// security.privileged=true removes the user namespace so UIDs pass through
+			// directly (host UID 1000 = container UID 1000) and disk mounts work without
+			// any idmapping. Acceptable trade-off for a local dev container.
+			fmt.Fprintf(out, "WARNING: idmapped mounts not supported — using security.privileged=true\n")
+			_ = c.UpdateInstanceConfig(ctx, opts.Name, map[string]string{
+				"raw.idmap":           "",
+				"security.privileged": "true",
+			})
+			if err2 := c.StartInstance(ctx, opts.Name); err2 != nil {
+				return fmt.Errorf("starting instance: %w", err2)
+			}
+		} else {
+			return fmt.Errorf("starting instance: %w", err)
+		}
 	}
 
 	if err := provisionUser(ctx, c, opts); err != nil {
@@ -237,12 +252,10 @@ func DryRun(_ context.Context, opts LaunchOpts) (string, error) {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "Dry-run: would create instance %q\n", opts.Name)
-	fmt.Fprintf(&b, "  Image:     %s\n", ImageAlias(opts.Distro, opts.DevTools))
-	fmt.Fprintf(&b, "  Profiles:  %s\n", strings.Join(BuildProfiles(opts.Docker), ", "))
+	fmt.Fprintf(&b, "  Image:     %s\n", ImageAlias(opts.Distro))
+	fmt.Fprintf(&b, "  Profiles:  %s\n", strings.Join(BuildProfiles(), ", "))
 	fmt.Fprintf(&b, "  User:      %s (UID=%d, GID=%d)\n", opts.Username, opts.UID, opts.GID)
 	fmt.Fprintf(&b, "  Sudo:      %s\n", strconv.FormatBool(opts.Sudo))
-	fmt.Fprintf(&b, "  Docker:    %s\n", strconv.FormatBool(opts.Docker))
-	fmt.Fprintf(&b, "  DevTools:  %s\n", strconv.FormatBool(opts.DevTools))
 	fmt.Fprintf(&b, "  Workspace: %s → %s\n", opts.Workspace, opts.MountPath)
 	if opts.Proxy != "" {
 		fmt.Fprintf(&b, "  Proxy:     %s\n", opts.Proxy)
@@ -260,9 +273,13 @@ func provisionUser(ctx context.Context, c Client, opts LaunchOpts) error {
 
 	switch opts.Distro {
 	case "alpine":
+		// Evict any existing user/group occupying our target UID/GID.
+		c.ExecInstance(ctx, name, []string{"sh", "-c", fmt.Sprintf(
+			`g=$(getent group %d 2>/dev/null | cut -d: -f1); [ -n "$g" ] && [ "$g" != %q ] && delgroup "$g" 2>/dev/null; true`, gid, u)})
+		c.ExecInstance(ctx, name, []string{"sh", "-c", fmt.Sprintf(
+			`u=$(getent passwd %d 2>/dev/null | cut -d: -f1); [ -n "$u" ] && [ "$u" != %q ] && deluser "$u" 2>/dev/null; true`, uid, u)})
 		// Alpine's adduser validates the shell against /etc/shells; zsh isn't added automatically.
 		c.ExecInstance(ctx, name, []string{"sh", "-c", "grep -qxF /bin/zsh /etc/shells || echo /bin/zsh >> /etc/shells"})
-		// addgroup may fail if the GID already exists; that's OK — we verify the user below.
 		c.ExecInstance(ctx, name, []string{"addgroup", "-g", strconv.Itoa(gid), u})
 		if _, err := c.ExecInstance(ctx, name, []string{
 			"adduser", "-D", "-u", strconv.Itoa(uid), "-G", u, "-s", "/bin/zsh", u,
@@ -271,6 +288,11 @@ func provisionUser(ctx context.Context, c Client, opts LaunchOpts) error {
 		}
 		c.ExecInstance(ctx, name, []string{"adduser", u, sudoGroup(opts.Distro)}) // best-effort
 	default: // ubuntu
+		// Evict any existing user/group occupying our target UID/GID.
+		c.ExecInstance(ctx, name, []string{"sh", "-c", fmt.Sprintf(
+			`u=$(getent passwd %d 2>/dev/null | cut -d: -f1); [ -n "$u" ] && [ "$u" != %q ] && userdel -r "$u" 2>/dev/null; true`, uid, u)})
+		c.ExecInstance(ctx, name, []string{"sh", "-c", fmt.Sprintf(
+			`g=$(getent group %d 2>/dev/null | cut -d: -f1); [ -n "$g" ] && [ "$g" != %q ] && groupdel "$g" 2>/dev/null; true`, gid, u)})
 		c.ExecInstance(ctx, name, []string{"groupadd", "-g", strconv.Itoa(gid), u}) // best-effort
 		if _, err := c.ExecInstance(ctx, name, []string{
 			"useradd", "-m", "-u", strconv.Itoa(uid), "-g", strconv.Itoa(gid), "-s", "/bin/zsh", u,
@@ -296,7 +318,7 @@ func provisionUser(ctx context.Context, c Client, opts LaunchOpts) error {
 		}
 	}
 
-	zprofile := []byte("[[ -d /workspace ]] && cd /workspace\n")
+	zprofile := []byte("export MISE_TRUSTED_CONFIG_PATHS=\"/workspace\"\n[[ -d /workspace ]] && cd /workspace\n")
 	if err := c.WriteFile(ctx, name, "/home/"+u+"/.zprofile", zprofile, uid, gid, 0644); err != nil {
 		return fmt.Errorf("writing .zprofile: %w", err)
 	}
@@ -321,9 +343,8 @@ func provisionUser(ctx context.Context, c Client, opts LaunchOpts) error {
 // renderZshrc returns the complete .zshrc content for the provisioned user.
 func renderZshrc(opts LaunchOpts) string {
 	var b strings.Builder
-	b.WriteString("export PATH=\"$HOME/.local/bin:$PATH\"\n")
+	b.WriteString("export PATH=\"/usr/local/bin:$HOME/.local/bin:$PATH\"\n")
 	b.WriteString("eval \"$(mise activate zsh)\"\n")
-	b.WriteString("export MISE_TRUSTED_CONFIG_PATHS=\"/workspace\"\n")
 	if opts.Sudo {
 		switch opts.Distro {
 		case "alpine":
@@ -333,15 +354,13 @@ func renderZshrc(opts LaunchOpts) string {
 			b.WriteString("alias apt-get='sudo apt-get'\n")
 		}
 	}
-	if opts.DevTools {
-		b.WriteString("[[ -f ~/.oh-my-zsh/oh-my-zsh.sh ]] && {\n")
-		b.WriteString("  export ZSH=\"$HOME/.oh-my-zsh\"\n")
-		b.WriteString("  ZSH_THEME=\"dpoggi\"\n")
-		b.WriteString("  plugins=(git zsh-autosuggestions)\n")
-		b.WriteString("  source $ZSH/oh-my-zsh.sh\n")
-		b.WriteString("  PROMPT=\"%{$fg[cyan]%}[incus]%{$reset_color%} ${PROMPT}\"\n")
-		b.WriteString("}\n")
-		b.WriteString("alias f=\"fzf --preview 'bat {-1} --color=always'\"\n")
-	}
+	b.WriteString("[[ -f ~/.oh-my-zsh/oh-my-zsh.sh ]] && {\n")
+	b.WriteString("  export ZSH=\"$HOME/.oh-my-zsh\"\n")
+	b.WriteString("  ZSH_THEME=\"dpoggi\"\n")
+	b.WriteString("  plugins=(git zsh-autosuggestions)\n")
+	b.WriteString("  source $ZSH/oh-my-zsh.sh\n")
+	b.WriteString("  PROMPT=\"%{$fg[cyan]%}[incus]%{$reset_color%} ${PROMPT}\"\n")
+	b.WriteString("}\n")
+	b.WriteString("alias f=\"fzf --preview 'bat {-1} --color=always'\"\n")
 	return b.String()
 }

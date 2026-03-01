@@ -472,8 +472,9 @@ func (c *client) LaunchBuilder(ctx context.Context, name, server, protocol, alia
 
 func (c *client) ExecStream(_ context.Context, name string, cmd []string, stdout, stderr io.Writer) error {
 	req := api.InstanceExecPost{
-		Command:   cmd,
-		WaitForWS: false,
+		Command:     cmd,
+		WaitForWS:   true, // required to connect I/O and receive exit code
+		Interactive: false,
 	}
 	args := &incusclient.InstanceExecArgs{
 		Stdout: stdout,
@@ -483,7 +484,18 @@ func (c *client) ExecStream(_ context.Context, name string, cmd []string, stdout
 	if err != nil {
 		return err
 	}
-	return op.Wait()
+	if err := op.Wait(); err != nil {
+		return err
+	}
+	// op.Wait() succeeds even when the command exits non-zero; check metadata.
+	if meta := op.Get().Metadata; meta != nil {
+		if retVal, ok := meta["return"]; ok {
+			if code, ok := retVal.(float64); ok && code != 0 {
+				return fmt.Errorf("exit %d", int(code))
+			}
+		}
+	}
+	return nil
 }
 
 func (c *client) PublishInstance(ctx context.Context, name, alias string) error {

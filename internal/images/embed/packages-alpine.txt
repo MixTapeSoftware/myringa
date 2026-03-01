@@ -1,19 +1,28 @@
+# Alpine equivalents of the Ubuntu package list.
+# build-base  = build-essential + g++ + gcc + make
+# openssl-dev = libssl-dev
+# yaml-dev    = libyaml-dev
+# zlib-dev    = zlib1g-dev
+# rust        = rustc  (Alpine has no separate rustc package)
+# py3-pip     = python3-pip
+# musl-dev    = glibc-dev equivalent (required for native gem/extension compilation)
+# linux-headers required for native extension compilation on Alpine
+# readline-dev required for Ruby IRB/Pry (implicit on Ubuntu via build-essential)
+# iputils-ping and net-tools skipped — busybox covers ping/ifconfig/netstat on Alpine
+
 bash
 build-base
-build-essential 
+gcompat
 cloud-init
-curl 
-g++
-gcc
+curl
+doas
 git
-gmp-dev
+gnupg
 gzip
 htop
 jq
-libssl-dev 
-libyaml-dev
 linux-headers
-make
+lsof
 musl-dev
 nano
 nodejs
@@ -24,14 +33,12 @@ openssl-dev
 procps
 py3-pip
 python3
+readline-dev
 rust
-rustc 
 tar
 unzip
 vim
 wget
 yaml-dev
 zlib-dev
-zlib1g-dev
-doas
 zsh

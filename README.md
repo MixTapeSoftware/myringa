@@ -7,7 +7,7 @@ A terminal dashboard and provisioning CLI for [Incus](https://linuxcontainers.or
 [![asciicast](https://asciinema.org/a/JHxpIO9BzBt7iZDS.svg)](https://asciinema.org/a/JHxpIO9BzBt7iZDS)
 
 - **TUI dashboard** — live table of containers and VMs: CPU (% of allocated capacity), memory, state
-- **`launch`** — one command to create a fully configured dev container: user account, sudo, workspace mount, proxy, Docker, dev tools
+- **`launch`** — one command to create a fully configured dev container: user account, passwordless sudo, workspace mount, oh-my-zsh, Docker, mise, claude
 - **`images build`** — build custom ring images locally from upstream Alpine or Ubuntu
 
 ## Why
@@ -76,12 +76,12 @@ CPU is shown as a percentage of the container's total allocated capacity (e.g. a
 Creates a new Incus dev container with:
 
 - A user account matching your host user (UID/GID, username)
-- `/bin/zsh` as the default shell with `mise` activated
+- `/bin/zsh` as the default shell with oh-my-zsh and `mise` activated
 - Your current working directory (or `--workspace`) bind-mounted at `/workspace` (or `--mount-path`)
 - UID/GID mapping so workspace files aren't owned by root inside the container
-- Optional passwordless privilege escalation (`--enable-sudo`; uses `doas` on Alpine, `sudo` on Ubuntu)
-- Optional Docker-in-Incus support
-- Optional dev tools (oh-my-zsh, fzf, bat, zsh-autosuggestions, Docker packages)
+- Passwordless privilege escalation by default (`doas` on Alpine, `sudo` on Ubuntu)
+- Docker-in-Incus support (always enabled via `ring-docker` profile)
+- Dev tools pre-installed: fzf, bat, neovim, claude CLI
 
 ```sh
 ring launch <name> [flags]
@@ -92,9 +92,7 @@ ring launch <name> [flags]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--distro` | `alpine` | OS distro: `alpine` or `ubuntu` |
-| `--dev-tools` | on | Dev image variant: oh-my-zsh, fzf, bat, Docker packages |
-| `--docker` | on | Enable Docker (implies `--dev-tools`) |
-| `--enable-sudo` | off | Passwordless privilege escalation (`doas` on Alpine, `sudo` on Ubuntu) |
+| `--enable-sudo` | on | Passwordless privilege escalation (`doas` on Alpine, `sudo` on Ubuntu) |
 | `--proxy` | — | HTTP proxy as `host:port` (sets `HTTP_PROXY` / `HTTPS_PROXY`) |
 | `--workspace` | cwd | Host directory to bind-mount |
 | `--mount-path` | `/workspace` | Container mount point |
@@ -103,17 +101,17 @@ ring launch <name> [flags]
 ### Examples
 
 ```sh
-# Minimal Alpine container
+# Alpine container (default)
 ring launch mydev
 
-# Ubuntu with Docker support
-ring launch mydev --distro ubuntu --docker
+# Ubuntu container
+ring launch mydev --distro ubuntu
 
-# Alpine dev container with a specific workspace
-ring launch mydev --dev-tools --workspace ~/projects/myapp
+# Mount a specific workspace directory
+ring launch mydev --workspace ~/projects/myapp
 
 # Preview what would be created
-ring launch mydev --distro ubuntu --docker --dry-run
+ring launch mydev --distro ubuntu --dry-run
 ```
 
 ### Auto-build
@@ -134,17 +132,13 @@ ring images build <distro> [flags]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--dev` | off | Build the `-dev` variant (includes oh-my-zsh, fzf, bat, Docker packages) |
 | `--tag` | `latest` | Image tag |
 
 ### Examples
 
 ```sh
-# Build the base Alpine image
+# Build the Alpine image
 ring images build alpine
-
-# Build the Alpine dev variant
-ring images build alpine --dev
 
 # Build Ubuntu with a custom tag
 ring images build ubuntu --tag 2025-02
@@ -152,33 +146,28 @@ ring images build ubuntu --tag 2025-02
 
 ### What gets built
 
-Base images (`alpine`, `ubuntu`):
+Every ring image includes:
 
 - Base OS packages (curl, git, zsh, doas/sudo, ca-certificates, etc.)
 - [mise](https://mise.jdx.dev/) at `/usr/local/bin/mise` for runtime version management
-- `/etc/skel` configured with `.zshrc` (mise activated)
-
-Dev images (`alpine-dev`, `ubuntu-dev`) additionally include:
-
-- [oh-my-zsh](https://ohmyz.sh/) + zsh-autosuggestions in `/etc/skel`
-- fzf, bat
-- Docker CE (service disabled by default; enabled at launch with `--docker`)
+- [oh-my-zsh](https://ohmyz.sh/) + zsh-autosuggestions
+- fzf, bat, neovim
+- Docker CE (service disabled by default; enabled at launch via `ring-docker` profile)
+- [claude](https://claude.ai/claude-code) CLI at `/usr/local/bin/claude`
 
 ### Image aliases
 
-| Distro | Variant | Alias |
-|--------|---------|-------|
-| Alpine | base | `ring/alpine:latest` |
-| Alpine | dev | `ring/alpine-dev:latest` |
-| Ubuntu | base | `ring/ubuntu:latest` |
-| Ubuntu | dev | `ring/ubuntu-dev:latest` |
+| Distro | Alias |
+|--------|-------|
+| Alpine | `ring/alpine:latest` |
+| Ubuntu | `ring/ubuntu:latest` |
 
 ## Incus profiles
 
-Two profiles are created automatically on first launch and shared across all ring containers:
+Two profiles are created automatically on first launch and applied to all ring containers:
 
 - **`ring-base`** — CPU/memory limits, 20 GiB root disk
-- **`ring-docker`** — security nesting + AppArmor unconfined (required for Docker-in-Incus)
+- **`ring-docker`** — security nesting + AppArmor unconfined (required for Docker-in-Incus; always applied)
 
 ## Development
 

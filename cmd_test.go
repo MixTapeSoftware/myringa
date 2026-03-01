@@ -89,8 +89,8 @@ func TestParseLaunchFlags_Defaults(t *testing.T) {
 	if opts.Distro != "alpine" {
 		t.Errorf("default distro: got %q, want alpine", opts.Distro)
 	}
-	if opts.Sudo {
-		t.Error("default sudo: should be false (opt-in via --enable-sudo)")
+	if !opts.Sudo {
+		t.Error("default sudo: should be true")
 	}
 	if opts.MountPath != "/workspace" {
 		t.Errorf("default mount path: got %q, want /workspace", opts.MountPath)
@@ -104,19 +104,6 @@ func TestParseLaunchFlags_Ubuntu(t *testing.T) {
 	}
 	if opts.Distro != "ubuntu" {
 		t.Errorf("distro: got %q, want ubuntu", opts.Distro)
-	}
-}
-
-func TestParseLaunchFlags_DockerImpliesDevTools(t *testing.T) {
-	opts, err := parseLaunchFlags([]string{"mydev", "--docker"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !opts.Docker {
-		t.Error("--docker: Docker should be true")
-	}
-	if !opts.DevTools {
-		t.Error("--docker: DevTools must be implied (Docker is baked into -dev images)")
 	}
 }
 

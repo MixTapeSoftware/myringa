@@ -30,9 +30,8 @@ type BuildClient interface {
 
 // BuildOpts holds parameters for building a ring custom image.
 type BuildOpts struct {
-	Distro   string // "alpine" or "ubuntu"
-	DevTools bool   // build the -dev variant
-	Tag      string // image tag, default "latest"
+	Distro string // "alpine" or "ubuntu"
+	Tag    string // image tag, default "latest"
 }
 
 // Validate checks opts and fills in defaults.
@@ -64,7 +63,7 @@ func upstream(distro string) upstreamRemote {
 	case "ubuntu":
 		return upstreamRemote{server, protocol, "ubuntu/24.04", "images:ubuntu/24.04"}
 	default:
-		return upstreamRemote{server, protocol, "alpine/3.21", "images:alpine/3.21"}
+		return upstreamRemote{server, protocol, "alpine/3.23", "images:alpine/3.23"}
 	}
 }
 
@@ -74,10 +73,7 @@ func UpstreamLabel(distro string) string {
 }
 
 // TargetAlias returns the local image alias that Build() will publish.
-func TargetAlias(distro string, devTools bool, tag string) string {
-	if devTools {
-		return fmt.Sprintf("ring/%s-dev:%s", distro, tag)
-	}
+func TargetAlias(distro, tag string) string {
 	return fmt.Sprintf("ring/%s:%s", distro, tag)
 }
 
@@ -110,14 +106,16 @@ func Build(ctx context.Context, c BuildClient, opts BuildOpts, out io.Writer) er
 	}
 
 	src := upstream(opts.Distro)
-	alias := TargetAlias(opts.Distro, opts.DevTools, opts.Tag)
+	alias := TargetAlias(opts.Distro, opts.Tag)
 	builder := builderName()
 
 	fmt.Fprintf(out, "Building %s from %s\n", alias, src.label)
 
 	// Always clean up the builder, even on failure.
+	// Stop first — DeleteInstance fails on running instances.
 	defer func() {
 		fmt.Fprintf(out, "Cleaning up builder %s...\n", builder)
+		_ = c.StopInstance(context.Background(), builder) // best-effort; may already be stopped
 		if err := c.DeleteInstance(context.Background(), builder); err != nil {
 			fmt.Fprintf(out, "WARNING: failed to delete builder %q: %v\n", builder, err)
 		}
@@ -168,7 +166,7 @@ func Build(ctx context.Context, c BuildClient, opts BuildOpts, out io.Writer) er
 	fmt.Fprintf(out, "Configuring /etc/skel...\n")
 	for _, cmd := range [][]string{
 		{"mkdir", "-p", "/etc/skel/.local/bin"},
-		{"sh", "-c", `echo 'export PATH="$HOME/.local/bin:$PATH"' > /etc/skel/.zshrc`},
+		{"sh", "-c", `echo 'export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"' > /etc/skel/.zshrc`},
 		{"sh", "-c", `echo 'eval "$(mise activate zsh)"' >> /etc/skel/.zshrc`},
 	} {
 		if err := c.ExecStream(ctx, builder, cmd, out, out); err != nil {
@@ -176,20 +174,50 @@ func Build(ctx context.Context, c BuildClient, opts BuildOpts, out io.Writer) er
 		}
 	}
 
-	// Step 5 (dev only): dev tools.
-	if opts.DevTools {
-		if err := installDevTools(ctx, c, builder, opts.Distro, out); err != nil {
-			return fmt.Errorf("installing dev tools: %w", err)
-		}
+	// Step 5: Dev tools (oh-my-zsh, fzf, bat, neovim, docker) — always installed.
+	if err := installDevTools(ctx, c, builder, opts.Distro, out); err != nil {
+		return fmt.Errorf("installing dev tools: %w", err)
 	}
 
-	// Step 6: Stop builder.
+	// Step 6: Install Claude Code.
+	// The official installer is a bash script; bash must be in the image.
+	// When run as root, the binary lands in /root/.local/bin/claude.
+	fmt.Fprintf(out, "Installing Claude Code...\n")
+	if err := c.ExecStream(ctx, builder, []string{"sh", "-c",
+		"curl -fsSL https://claude.ai/install.sh | bash",
+	}, out, out); err != nil {
+		return fmt.Errorf("installing claude: %w", err)
+	}
+	// Inspect what the installer created so we can diagnose wrapper vs binary.
+	fmt.Fprintf(out, "Inspecting installed claude...\n")
+	_ = c.ExecStream(ctx, builder, []string{"sh", "-c",
+		`echo "=== ls -la ~/.local/bin/claude ===" && ls -la /root/.local/bin/claude && ` +
+			`echo "=== file type ===" && file /root/.local/bin/claude 2>/dev/null || true && ` +
+			`echo "=== head -1 ===" && head -1 /root/.local/bin/claude && ` +
+			`echo "=== ls ~/.claude ===" && ls /root/.claude/ 2>/dev/null || true`,
+	}, out, out)
+	// Copy the actual ELF binary to /usr/local/bin. If ~/.local/bin/claude is a
+	// wrapper script referencing ~/.claude/downloads/, find and copy the real binary.
+	fmt.Fprintf(out, "Installing claude to /usr/local/bin...\n")
+	if err := c.ExecStream(ctx, builder, []string{"sh", "-c",
+		// Find the actual ELF binary: prefer the download (actual binary),
+		// fall back to ~/.local/bin/claude if it's already the binary.
+		`real=$(find /root/.claude/downloads -name 'claude-*' -type f -perm /111 2>/dev/null | sort -V | tail -1) && ` +
+			`[ -z "$real" ] && real=/root/.local/bin/claude && ` +
+			`[ -f "$real" ] || { echo "ERROR: claude binary not found at $real" >&2; exit 1; } && ` +
+			`cp "$real" /usr/local/bin/claude && chmod 0755 /usr/local/bin/claude && ` +
+			`echo "Installed from: $real"`,
+	}, out, out); err != nil {
+		return fmt.Errorf("installing claude to /usr/local/bin: %w", err)
+	}
+
+	// Step 7: Stop builder.
 	fmt.Fprintf(out, "Stopping builder...\n")
 	if err := c.StopInstance(ctx, builder); err != nil {
 		return fmt.Errorf("stopping builder: %w", err)
 	}
 
-	// Step 7: Publish (replacing any existing image with the same alias).
+	// Step 8: Publish (replacing any existing image with the same alias).
 	fmt.Fprintf(out, "Publishing locally as %s...\n", alias)
 	if exists, err := c.ImageAliasExists(ctx, alias); err != nil {
 		return fmt.Errorf("checking existing image: %w", err)
@@ -210,10 +238,19 @@ func Build(ctx context.Context, c BuildClient, opts BuildOpts, out io.Writer) er
 func installPackages(ctx context.Context, c BuildClient, builder, distro string, pkgs []string, out io.Writer) error {
 	switch distro {
 	case "alpine":
-		if err := c.ExecStream(ctx, builder, []string{"apk", "update"}, out, out); err != nil {
-			return err
+		// The linuxcontainers.org Alpine image may not have /etc/apk/repositories
+		// populated. Write it explicitly from the container's own alpine-release version.
+		setupRepos := `ver=$(cut -d. -f1,2 /etc/alpine-release) && ` +
+			`printf 'https://dl-cdn.alpinelinux.org/alpine/v%s/main\nhttps://dl-cdn.alpinelinux.org/alpine/v%s/community\n' "$ver" "$ver" > /etc/apk/repositories`
+		if err := c.ExecStream(ctx, builder, []string{"sh", "-c", setupRepos}, out, out); err != nil {
+			return fmt.Errorf("configuring alpine repositories: %w", err)
 		}
-		return c.ExecStream(ctx, builder, append([]string{"apk", "add", "--no-cache"}, pkgs...), out, out)
+		// apk update may exit non-zero if a mirror is temporarily unavailable (exit 2).
+		// Treat it as a warning — apk add will fail explicitly if packages are missing.
+		if err := c.ExecStream(ctx, builder, []string{"apk", "update"}, out, out); err != nil {
+			fmt.Fprintf(out, "WARNING: apk update returned an error (continuing): %v\n", err)
+		}
+		return c.ExecStream(ctx, builder, append([]string{"apk", "add"}, pkgs...), out, out)
 	default: // ubuntu
 		if err := c.ExecStream(ctx, builder, []string{"apt-get", "update", "-q"}, out, out); err != nil {
 			return err
@@ -223,7 +260,12 @@ func installPackages(ctx context.Context, c BuildClient, builder, distro string,
 }
 
 func installDevTools(ctx context.Context, c BuildClient, builder, distro string, out io.Writer) error {
-	fmt.Fprintf(out, "Installing dev tools (oh-my-zsh, fzf, bat, docker)...\n")
+	fmt.Fprintf(out, "Installing dev tools (oh-my-zsh, fzf, bat, nvim, docker)...\n")
+
+	// fzf, bat, neovim
+	if err := installDevPackages(ctx, c, builder, distro, out); err != nil {
+		return err
+	}
 
 	// Oh My Zsh into /etc/skel (no curl|sh for runtime containers — build-time only)
 	if err := c.ExecStream(ctx, builder, []string{"sh", "-c",
@@ -250,11 +292,67 @@ func installDevTools(ctx context.Context, c BuildClient, builder, distro string,
 	return nil
 }
 
-func installDockerPackages(ctx context.Context, c BuildClient, builder, distro string, out io.Writer) error {
+func installDevPackages(ctx context.Context, c BuildClient, builder, distro string, out io.Writer) error {
 	switch distro {
 	case "alpine":
 		return c.ExecStream(ctx, builder,
-			[]string{"apk", "add", "--no-cache", "docker", "docker-compose"}, out, out)
+			[]string{"apk", "add", "fzf", "bat", "neovim"}, out, out)
+	default: // ubuntu
+		if err := c.ExecStream(ctx, builder,
+			[]string{"apt-get", "install", "-y", "-q", "fzf", "bat", "neovim"}, out, out); err != nil {
+			return err
+		}
+		// Ubuntu installs bat as batcat; symlink so 'bat' works everywhere.
+		return c.ExecStream(ctx, builder,
+			[]string{"ln", "-sf", "/usr/bin/batcat", "/usr/local/bin/bat"}, out, out)
+	}
+}
+
+// appArmorMaskScript returns a shell script that installs a boot-time service
+// to mask /sys/module/apparmor/parameters/enabled inside the container.
+// Docker reads that file; if it sees "Y" it tries to load the docker-default
+// AppArmor profile via securityfs, which isn't accessible inside Incus containers.
+// Setting it to "N" makes Docker skip AppArmor entirely.
+// (The container's actual security boundary is the Incus/LXC AppArmor profile on the host.)
+func appArmorMaskScript(distro string) string {
+	if distro == "alpine" {
+		return `cat > /etc/init.d/mask-apparmor <<'EOF'
+#!/sbin/openrc-run
+description="Mask AppArmor enabled flag for Docker-in-Incus"
+depend() { before docker containerd; keyword -stop; }
+start() {
+    echo N > /run/apparmor_disabled
+    mount --bind /run/apparmor_disabled /sys/module/apparmor/parameters/enabled
+}
+EOF
+chmod +x /etc/init.d/mask-apparmor
+rc-update add mask-apparmor boot`
+	}
+	// ubuntu — systemd
+	return `cat > /etc/systemd/system/mask-apparmor.service <<'EOF'
+[Unit]
+Description=Mask AppArmor enabled flag for Docker-in-Incus
+DefaultDependencies=no
+Before=docker.service containerd.service docker.socket
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c "echo N > /run/apparmor_disabled && mount --bind /run/apparmor_disabled /sys/module/apparmor/parameters/enabled"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable mask-apparmor.service`
+}
+
+func installDockerPackages(ctx context.Context, c BuildClient, builder, distro string, out io.Writer) error {
+	switch distro {
+	case "alpine":
+		if err := c.ExecStream(ctx, builder,
+			[]string{"apk", "add", "docker", "docker-compose"}, out, out); err != nil {
+			return err
+		}
 	default: // ubuntu — add Docker apt repo then install
 		for _, cmd := range [][]string{
 			{"sh", "-c", "install -m 0755 -d /etc/apt/keyrings"},
@@ -273,8 +371,13 @@ func installDockerPackages(ctx context.Context, c BuildClient, builder, distro s
 				return fmt.Errorf("installing docker packages: %w", err)
 			}
 		}
-		return nil
 	}
+	// Install the AppArmor mask service so Docker doesn't try to load profiles
+	// via securityfs (which isn't accessible inside Incus containers).
+	if err := c.ExecStream(ctx, builder, []string{"sh", "-c", appArmorMaskScript(distro)}, out, out); err != nil {
+		return fmt.Errorf("installing AppArmor mask service: %w", err)
+	}
+	return nil
 }
 
 func disableDockerCmd(distro string) []string {

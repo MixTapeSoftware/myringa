@@ -133,9 +133,7 @@ func parseLaunchFlags(args []string) (provision.LaunchOpts, error) {
 	fs := flag.NewFlagSet("launch", flag.ContinueOnError)
 
 	distro := fs.String("distro", "alpine", "OS distro: alpine, ubuntu")
-	docker := fs.Bool("docker", true, "Enable Docker (implies --dev-tools)")
-	devTools := fs.Bool("dev-tools", true, "Use dev image variant (oh-my-zsh, fzf, bat, Docker packages)")
-	enableSudo := fs.Bool("enable-sudo", false, "Grant passwordless sudo inside the container")
+	enableSudo := fs.Bool("enable-sudo", true, "Grant passwordless sudo/doas inside the container")
 	proxy := fs.String("proxy", "", "HTTP proxy host:port")
 	workspace := fs.String("workspace", "", "Host directory to mount (default: cwd)")
 	mountPath := fs.String("mount-path", "/workspace", "Container mount point")
@@ -147,11 +145,6 @@ func parseLaunchFlags(args []string) (provision.LaunchOpts, error) {
 
 	if name == "" {
 		return provision.LaunchOpts{}, fmt.Errorf("container name is required")
-	}
-
-	// --docker implies --dev-tools (Docker is baked into -dev images)
-	if *docker {
-		*devTools = true
 	}
 
 	// Default workspace to cwd.
@@ -176,8 +169,6 @@ func parseLaunchFlags(args []string) (provision.LaunchOpts, error) {
 	return provision.LaunchOpts{
 		Name:      name,
 		Distro:    *distro,
-		Docker:    *docker,
-		DevTools:  *devTools,
 		Sudo:      *enableSudo,
 		Proxy:     *proxy,
 		Workspace: ws,
@@ -193,9 +184,7 @@ const launchUsage = `
 Usage: ring launch [flags] <name>
 
   --distro string       OS distro: alpine, ubuntu (default "alpine")
-  --docker              Enable Docker (implies --dev-tools)
-  --dev-tools           Use dev image variant (oh-my-zsh, fzf, bat, Docker packages)
-  --no-sudo             Disable passwordless sudo (sudo is on by default)
+  --enable-sudo         Grant passwordless sudo/doas (default: true)
   --proxy string        HTTP proxy host:port
   --workspace string    Host directory to mount (default: cwd)
   --mount-path string   Container mount point (default: /workspace)
@@ -204,7 +193,6 @@ Usage: ring launch [flags] <name>
 Examples:
   ring launch mydev
   ring launch mydev --distro ubuntu
-  ring launch mydev --docker --dev-tools
   ring launch mydev --dry-run
 `
 
@@ -223,7 +211,7 @@ func launchWithAutoBuild(ctx context.Context, c incus.Client, client *incusProvi
 	// Image missing — pause spinner, stream build output, then resume.
 	spin.Pause()
 	fmt.Printf("Image %q not found. Building it now (this takes a few minutes)...\n\n", imgErr.Alias)
-	buildOpts := images.BuildOpts{Distro: imgErr.Distro, DevTools: imgErr.DevTools}
+	buildOpts := images.BuildOpts{Distro: imgErr.Distro}
 	if err := images.Build(ctx, c, buildOpts, os.Stdout); err != nil {
 		return fmt.Errorf("building image: %w", err)
 	}
@@ -234,7 +222,6 @@ func launchWithAutoBuild(ctx context.Context, c incus.Client, client *incusProvi
 
 func runImagesBuild(args []string) {
 	fs := flag.NewFlagSet("images build", flag.ContinueOnError)
-	devTools := fs.Bool("dev", false, "Build the -dev variant (oh-my-zsh, fzf, bat, Docker packages)")
 	tag := fs.String("tag", "latest", "Image tag")
 
 	if err := fs.Parse(args); err != nil {
@@ -243,14 +230,13 @@ func runImagesBuild(args []string) {
 	}
 	if fs.NArg() == 0 {
 		fmt.Fprintln(os.Stderr, "ring images build: distro is required (alpine or ubuntu)")
-		fmt.Fprintln(os.Stderr, "\nUsage: ring images build <distro> [--dev] [--tag <tag>]")
+		fmt.Fprintln(os.Stderr, "\nUsage: ring images build <distro> [--tag <tag>]")
 		os.Exit(1)
 	}
 
 	opts := images.BuildOpts{
-		Distro:   fs.Arg(0),
-		DevTools: *devTools,
-		Tag:      *tag,
+		Distro: fs.Arg(0),
+		Tag:    *tag,
 	}
 
 	c, err := incus.Connect()
@@ -384,10 +370,8 @@ func isBoolFlag(arg string) bool {
 	name := strings.TrimLeft(arg, "-")
 	// Known boolean flags for the launch subcommand
 	boolFlags := map[string]bool{
-		"docker":    true,
-		"dev-tools": true,
-		"no-sudo":   true,
-		"dry-run":   true, // keep old name for extractName compatibility
+		"enable-sudo": true,
+		"dry-run":     true,
 	}
 	return boolFlags[name]
 }

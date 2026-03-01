@@ -114,8 +114,8 @@ func TestBuildOpts_Validate_DefaultsTag(t *testing.T) {
 
 func TestUpstreamLabel_Alpine(t *testing.T) {
 	got := images.UpstreamLabel("alpine")
-	if got != "images:alpine/3.21" {
-		t.Errorf("got %q, want images:alpine/3.21", got)
+	if got != "images:alpine/3.23" {
+		t.Errorf("got %q, want images:alpine/3.23", got)
 	}
 }
 
@@ -128,24 +128,17 @@ func TestUpstreamLabel_Ubuntu(t *testing.T) {
 
 // ── Target alias ──────────────────────────────────────────────────────────────
 
-func TestTargetAlias_NoDevTools(t *testing.T) {
+func TestTargetAlias(t *testing.T) {
 	cases := []struct{ distro, tag, want string }{
 		{"alpine", "latest", "ring/alpine:latest"},
 		{"ubuntu", "latest", "ring/ubuntu:latest"},
 		{"alpine", "v2", "ring/alpine:v2"},
 	}
 	for _, c := range cases {
-		got := images.TargetAlias(c.distro, false, c.tag)
+		got := images.TargetAlias(c.distro, c.tag)
 		if got != c.want {
-			t.Errorf("distro=%q dev=false tag=%q: got %q, want %q", c.distro, c.tag, got, c.want)
+			t.Errorf("distro=%q tag=%q: got %q, want %q", c.distro, c.tag, got, c.want)
 		}
-	}
-}
-
-func TestTargetAlias_WithDevTools(t *testing.T) {
-	got := images.TargetAlias("alpine", true, "latest")
-	if got != "ring/alpine-dev:latest" {
-		t.Errorf("got %q, want ring/alpine-dev:latest", got)
 	}
 }
 
@@ -208,12 +201,12 @@ func TestBuild_LaunchesBuilderWithCorrectRemoteSource(t *testing.T) {
 	for _, c := range mc.calls {
 		if strings.HasPrefix(c, "LaunchBuilder:") &&
 			strings.Contains(c, "images.linuxcontainers.org") &&
-			strings.Contains(c, "alpine/3.21") {
+			strings.Contains(c, "alpine/3.23") {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("LaunchBuilder must use images.linuxcontainers.org + alpine/3.21, calls: %v", mc.calls)
+		t.Errorf("LaunchBuilder must use images.linuxcontainers.org + alpine/3.23, calls: %v", mc.calls)
 	}
 }
 
@@ -255,9 +248,6 @@ func TestBuild_InstallsPackages_Alpine(t *testing.T) {
 		t.Fatalf("Build failed: %v", err)
 	}
 
-	if !mc.hasCall("ExecStream:apk update") {
-		t.Errorf("alpine build must run apk update, calls: %v", mc.calls)
-	}
 	if !mc.hasCall("ExecStream:apk add") {
 		t.Errorf("alpine build must run apk add, calls: %v", mc.calls)
 	}
@@ -303,25 +293,9 @@ func TestBuild_InstallsMise(t *testing.T) {
 	}
 }
 
-func TestBuild_DevTools_False_NoOhMyZsh(t *testing.T) {
+func TestBuild_InstallsOhMyZsh(t *testing.T) {
 	mc := newMock()
-	opts := images.BuildOpts{Distro: "alpine", DevTools: false, Tag: "latest"}
-	var out bytes.Buffer
-
-	if err := images.Build(context.Background(), mc, opts, &out); err != nil {
-		t.Fatalf("Build failed: %v", err)
-	}
-
-	for _, c := range mc.calls {
-		if strings.Contains(c, "oh-my-zsh") || strings.Contains(c, "ohmyzsh") {
-			t.Errorf("non-dev build must not install oh-my-zsh, got call: %s", c)
-		}
-	}
-}
-
-func TestBuild_DevTools_True_InstallsOhMyZsh(t *testing.T) {
-	mc := newMock()
-	opts := images.BuildOpts{Distro: "alpine", DevTools: true, Tag: "latest"}
+	opts := images.BuildOpts{Distro: "alpine", Tag: "latest"}
 	var out bytes.Buffer
 
 	if err := images.Build(context.Background(), mc, opts, &out); err != nil {
@@ -335,13 +309,13 @@ func TestBuild_DevTools_True_InstallsOhMyZsh(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("dev build must install oh-my-zsh, calls: %v", mc.calls)
+		t.Errorf("build must always install oh-my-zsh, calls: %v", mc.calls)
 	}
 }
 
-func TestBuild_DevTools_True_InstallsDockerPackages(t *testing.T) {
+func TestBuild_InstallsDockerPackages(t *testing.T) {
 	mc := newMock()
-	opts := images.BuildOpts{Distro: "ubuntu", DevTools: true, Tag: "latest"}
+	opts := images.BuildOpts{Distro: "ubuntu", Tag: "latest"}
 	var out bytes.Buffer
 
 	if err := images.Build(context.Background(), mc, opts, &out); err != nil {
@@ -355,13 +329,13 @@ func TestBuild_DevTools_True_InstallsDockerPackages(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("dev build must install docker packages, calls: %v", mc.calls)
+		t.Errorf("build must always install docker packages, calls: %v", mc.calls)
 	}
 }
 
-func TestBuild_DevTools_True_NoDockerCurlSh(t *testing.T) {
+func TestBuild_NoDockerCurlSh(t *testing.T) {
 	mc := newMock()
-	opts := images.BuildOpts{Distro: "ubuntu", DevTools: true, Tag: "latest"}
+	opts := images.BuildOpts{Distro: "ubuntu", Tag: "latest"}
 	var out bytes.Buffer
 
 	if err := images.Build(context.Background(), mc, opts, &out); err != nil {
@@ -386,7 +360,7 @@ func TestBuild_StopsBeforePublish(t *testing.T) {
 
 	stopIdx, publishIdx := -1, -1
 	for i, c := range mc.calls {
-		if strings.HasPrefix(c, "StopInstance:") {
+		if strings.HasPrefix(c, "StopInstance:") && stopIdx == -1 {
 			stopIdx = i
 		}
 		if strings.HasPrefix(c, "PublishInstance:") {
@@ -406,28 +380,26 @@ func TestBuild_StopsBeforePublish(t *testing.T) {
 
 func TestBuild_PublishesCorrectAlias(t *testing.T) {
 	cases := []struct {
-		distro   string
-		devTools bool
-		tag      string
-		want     string
+		distro string
+		tag    string
+		want   string
 	}{
-		{"alpine", false, "latest", "ring/alpine:latest"},
-		{"ubuntu", false, "latest", "ring/ubuntu:latest"},
-		{"alpine", true, "latest", "ring/alpine-dev:latest"},
-		{"alpine", false, "v2", "ring/alpine:v2"},
+		{"alpine", "latest", "ring/alpine:latest"},
+		{"ubuntu", "latest", "ring/ubuntu:latest"},
+		{"alpine", "v2", "ring/alpine:v2"},
 	}
 
 	for _, c := range cases {
 		mc := newMock()
-		opts := images.BuildOpts{Distro: c.distro, DevTools: c.devTools, Tag: c.tag}
+		opts := images.BuildOpts{Distro: c.distro, Tag: c.tag}
 		var out bytes.Buffer
 
 		if err := images.Build(context.Background(), mc, opts, &out); err != nil {
-			t.Fatalf("distro=%q dev=%v tag=%q: Build failed: %v", c.distro, c.devTools, c.tag, err)
+			t.Fatalf("distro=%q tag=%q: Build failed: %v", c.distro, c.tag, err)
 		}
 		if mc.publishedAlias != c.want {
-			t.Errorf("distro=%q dev=%v tag=%q: published alias = %q, want %q",
-				c.distro, c.devTools, c.tag, mc.publishedAlias, c.want)
+			t.Errorf("distro=%q tag=%q: published alias = %q, want %q",
+				c.distro, c.tag, mc.publishedAlias, c.want)
 		}
 	}
 }
