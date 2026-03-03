@@ -137,7 +137,13 @@ func Build(ctx context.Context, c BuildClient, opts BuildOpts, out io.Writer) er
 		return fmt.Errorf("installing packages: %w", err)
 	}
 
-	// Step 3: Install mise.
+	// Step 3: Install gh CLI (Ubuntu only — Alpine gets it via packages-alpine.txt).
+	fmt.Fprintf(out, "Installing gh CLI...\n")
+	if err := installGHCLI(ctx, c, builder, opts.Distro, out); err != nil {
+		return fmt.Errorf("installing gh CLI: %w", err)
+	}
+
+	// Step 4: Install mise.
 	fmt.Fprintf(out, "Installing mise...\n")
 	if err := c.ExecStream(ctx, builder, []string{"sh", "-c",
 		"curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh",
@@ -145,7 +151,7 @@ func Build(ctx context.Context, c BuildClient, opts BuildOpts, out io.Writer) er
 		return fmt.Errorf("installing mise: %w", err)
 	}
 
-	// Step 4: Configure /etc/skel.
+	// Step 5: Configure /etc/skel.
 	fmt.Fprintf(out, "Configuring /etc/skel...\n")
 	for _, cmd := range [][]string{
 		{"mkdir", "-p", "/etc/skel/.local/bin"},
@@ -157,12 +163,19 @@ func Build(ctx context.Context, c BuildClient, opts BuildOpts, out io.Writer) er
 		}
 	}
 
-	// Step 5: Dev tools (oh-my-zsh, fzf, bat, neovim, docker).
+	// Step 6: Install headless Chrome/Chromium for testing.
+	// Alpine: already in package list. Ubuntu: Google Chrome apt repo.
+	fmt.Fprintf(out, "Installing headless Chrome...\n")
+	if err := installChrome(ctx, c, builder, opts.Distro, out); err != nil {
+		return fmt.Errorf("installing chrome: %w", err)
+	}
+
+	// Step 7: Dev tools (oh-my-zsh, fzf, bat, neovim, docker).
 	if err := installDevTools(ctx, c, builder, opts.Distro, out); err != nil {
 		return fmt.Errorf("installing dev tools: %w", err)
 	}
 
-	// Step 6: Install Claude Code.
+	// Step 8: Install Claude Code.
 	// The official installer is a bash script; bash must be in the image.
 	// When run as root, the binary lands in /root/.local/bin/claude.
 	fmt.Fprintf(out, "Installing Claude Code...\n")
@@ -194,13 +207,13 @@ func Build(ctx context.Context, c BuildClient, opts BuildOpts, out io.Writer) er
 		return fmt.Errorf("installing claude to /usr/local/bin: %w", err)
 	}
 
-	// Step 6: Stop builder.
+	// Step 9: Stop builder.
 	fmt.Fprintf(out, "Stopping builder...\n")
 	if err := c.StopInstance(ctx, builder); err != nil {
 		return fmt.Errorf("stopping builder: %w", err)
 	}
 
-	// Step 7: Publish (replacing any existing image with the same alias).
+	// Step 10: Publish (replacing any existing image with the same alias).
 	fmt.Fprintf(out, "Publishing locally as %s...\n", alias)
 	if exists, err := c.ImageAliasExists(ctx, alias); err != nil {
 		return fmt.Errorf("checking existing image: %w", err)
@@ -240,6 +253,44 @@ func installPackages(ctx context.Context, c BuildClient, builder, distro string,
 		}
 		return c.ExecStream(ctx, builder, append([]string{"apt-get", "install", "-y", "-q"}, pkgs...), out, out)
 	}
+}
+
+func installGHCLI(ctx context.Context, c BuildClient, builder, distro string, out io.Writer) error {
+	if distro != "ubuntu" {
+		return nil // Alpine: github-cli installed via packages-alpine.txt
+	}
+	for _, cmd := range [][]string{
+		{"sh", "-c", "install -m 0755 -d /etc/apt/keyrings"},
+		{"sh", "-c", "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/etc/apt/keyrings/githubcli-archive-keyring.gpg"},
+		{"sh", "-c", "chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg"},
+		{"sh", "-c", `echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list`},
+		{"apt-get", "update", "-q"},
+		{"apt-get", "install", "-y", "-q", "gh"},
+	} {
+		if err := c.ExecStream(ctx, builder, cmd, out, out); err != nil {
+			return fmt.Errorf("installing gh (ubuntu): %w", err)
+		}
+	}
+	return nil
+}
+
+func installChrome(ctx context.Context, c BuildClient, builder, distro string, out io.Writer) error {
+	if distro != "ubuntu" {
+		return nil // Alpine: chromium installed via packages-alpine.txt
+	}
+	for _, cmd := range [][]string{
+		{"sh", "-c", "install -m 0755 -d /etc/apt/keyrings"},
+		{"sh", "-c", "curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg"},
+		{"sh", "-c", "chmod go+r /etc/apt/keyrings/google-chrome.gpg"},
+		{"sh", "-c", `echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list`},
+		{"apt-get", "update", "-q"},
+		{"apt-get", "install", "-y", "-q", "google-chrome-stable"},
+	} {
+		if err := c.ExecStream(ctx, builder, cmd, out, out); err != nil {
+			return fmt.Errorf("installing google-chrome (ubuntu): %w", err)
+		}
+	}
+	return nil
 }
 
 func installDevTools(ctx context.Context, c BuildClient, builder, distro string, out io.Writer) error {

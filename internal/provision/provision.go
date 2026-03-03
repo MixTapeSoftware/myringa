@@ -47,18 +47,28 @@ type InstanceRequest struct {
 	Config     map[string]string
 }
 
+// MountSpec describes an extra host→container bind mount.
+type MountSpec struct {
+	HostPath      string // absolute host path
+	ContainerPath string // absolute container path
+}
+
 // LaunchOpts holds all parameters for launching a new dev container.
 type LaunchOpts struct {
-	Name      string // required; [a-zA-Z0-9][a-zA-Z0-9-]*
-	Distro    string // "alpine" or "ubuntu"
-	Sudo      bool   // NOPASSWD sudo (default: true)
-	Proxy     string // "host:port" or empty
-	Workspace string // absolute host path (default: cwd)
-	MountPath string // absolute container path (default: /workspace)
-	Username  string // POSIX [a-z_][a-z0-9_-]*
-	UID       int
-	GID       int
-	DryRun    bool // if true, validate only — make no API calls
+	Name        string      // required; [a-zA-Z0-9][a-zA-Z0-9-]*
+	Distro      string      // "alpine" or "ubuntu"
+	Sudo        bool        // NOPASSWD sudo (default: true)
+	Proxy       string      // "host:port" or empty
+	Workspace   string      // absolute host path (default: cwd)
+	MountPath   string      // absolute container path (default: /workspace)
+	ExtraMounts []MountSpec // additional bind mounts (repeatable --mount)
+	Username    string      // POSIX [a-z_][a-z0-9_-]*
+	UID         int
+	GID         int
+	DryRun      bool   // if true, validate only — make no API calls
+	GHToken     string // fine-grained PAT; stored as environment.GH_TOKEN in incus config
+	GHUserName  string // git user.name (required if GHToken is set)
+	GHUserEmail string // git user.email (required if GHToken is set)
 }
 
 var (
@@ -90,6 +100,27 @@ func (o LaunchOpts) Validate() error {
 	}
 	if o.Proxy != "" && !proxyRe.MatchString(o.Proxy) {
 		return fmt.Errorf("Proxy %q is invalid: must be host:port (no scheme)", o.Proxy)
+	}
+	if o.GHToken != "" {
+		if o.GHUserName == "" {
+			return fmt.Errorf("GHUserName is required when GHToken is set")
+		}
+		if o.GHUserEmail == "" {
+			return fmt.Errorf("GHUserEmail is required when GHToken is set")
+		}
+	}
+	seenContainerPaths := map[string]bool{o.MountPath: true}
+	for i, m := range o.ExtraMounts {
+		if !strings.HasPrefix(m.HostPath, "/") {
+			return fmt.Errorf("ExtraMounts[%d]: HostPath must be an absolute path, got %q", i, m.HostPath)
+		}
+		if !strings.HasPrefix(m.ContainerPath, "/") {
+			return fmt.Errorf("ExtraMounts[%d]: ContainerPath must be an absolute path, got %q", i, m.ContainerPath)
+		}
+		if seenContainerPaths[m.ContainerPath] {
+			return fmt.Errorf("ExtraMounts[%d]: ContainerPath %q conflicts with an existing mount", i, m.ContainerPath)
+		}
+		seenContainerPaths[m.ContainerPath] = true
 	}
 	return nil
 }
@@ -192,6 +223,10 @@ func Launch(ctx context.Context, c Client, opts LaunchOpts, out io.Writer) error
 		config["environment.HTTP_PROXY"] = proxyURL
 		config["environment.HTTPS_PROXY"] = proxyURL
 	}
+	if opts.GHToken != "" {
+		config["environment.GH_TOKEN"] = opts.GHToken
+		config["environment.GITHUB_TOKEN"] = opts.GHToken
+	}
 
 	req := InstanceRequest{
 		Name:       opts.Name,
@@ -207,13 +242,29 @@ func Launch(ctx context.Context, c Client, opts LaunchOpts, out io.Writer) error
 	//   1. shift=true  — kernel idmapped mounts (Linux 5.12+); cleanest, no subuid/subgid needed.
 	//   2. raw.idmap   — AddDevice succeeds but StartInstance may still fail on older kernels.
 	//   3. plain mount — no UID mapping; workspace files appear owned by root inside container.
+	shiftWorked := true
 	if err := c.AddDevice(ctx, opts.Name, "workspace", WorkspaceDeviceWithShift(opts.Workspace, opts.MountPath)); err != nil {
+		shiftWorked = false
 		// shift=true not supported; try raw.idmap + plain device.
 		_ = c.UpdateInstanceConfig(ctx, opts.Name, map[string]string{
 			"raw.idmap": fmt.Sprintf("both %d %d", opts.UID, opts.GID),
 		})
 		if addErr := c.AddDevice(ctx, opts.Name, "workspace", WorkspaceDevice(opts.Workspace, opts.MountPath)); addErr != nil {
 			return fmt.Errorf("adding workspace device: %w", addErr)
+		}
+	}
+
+	// Extra mounts use the same shift strategy as the workspace device.
+	for i, m := range opts.ExtraMounts {
+		devName := fmt.Sprintf("mount-%d", i)
+		if shiftWorked {
+			if err := c.AddDevice(ctx, opts.Name, devName, WorkspaceDeviceWithShift(m.HostPath, m.ContainerPath)); err != nil {
+				return fmt.Errorf("adding extra mount %q: %w", devName, err)
+			}
+		} else {
+			if err := c.AddDevice(ctx, opts.Name, devName, WorkspaceDevice(m.HostPath, m.ContainerPath)); err != nil {
+				return fmt.Errorf("adding extra mount %q: %w", devName, err)
+			}
 		}
 	}
 
@@ -240,6 +291,12 @@ func Launch(ctx context.Context, c Client, opts LaunchOpts, out io.Writer) error
 		return fmt.Errorf("provisioning user: %w", err)
 	}
 
+	if opts.GHToken != "" {
+		if err := configureGitHub(ctx, c, opts); err != nil {
+			return fmt.Errorf("configuring GitHub auth: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -257,8 +314,16 @@ func DryRun(_ context.Context, opts LaunchOpts) (string, error) {
 	fmt.Fprintf(&b, "  User:      %s (UID=%d, GID=%d)\n", opts.Username, opts.UID, opts.GID)
 	fmt.Fprintf(&b, "  Sudo:      %s\n", strconv.FormatBool(opts.Sudo))
 	fmt.Fprintf(&b, "  Workspace: %s → %s\n", opts.Workspace, opts.MountPath)
+	for i, m := range opts.ExtraMounts {
+		fmt.Fprintf(&b, "  Mount[%d]:  %s → %s\n", i, m.HostPath, m.ContainerPath)
+	}
 	if opts.Proxy != "" {
 		fmt.Fprintf(&b, "  Proxy:     %s\n", opts.Proxy)
+	}
+	if opts.GHToken != "" {
+		fmt.Fprintf(&b, "  GitHub:    GH_TOKEN set; git identity %s <%s>\n", opts.GHUserName, opts.GHUserEmail)
+	} else {
+		fmt.Fprintf(&b, "  GitHub:    not configured (use --gh-token)\n")
 	}
 	return b.String(), nil
 }
@@ -337,6 +402,26 @@ func provisionUser(ctx context.Context, c Client, opts LaunchOpts) error {
 	// Run mise install best-effort (don't fail launch on mise errors).
 	c.ExecInstance(ctx, name, []string{"su", "-", u, "-c", "mise install 2>/dev/null || true"})
 
+	return nil
+}
+
+// configureGitHub injects GH_TOKEN into the container environment and
+// configures the user's git identity and credential helper.
+func configureGitHub(ctx context.Context, c Client, opts LaunchOpts) error {
+	// GH_TOKEN is set in the instance config at create time (before start)
+	// so it's available in the container environment. Here we just configure git.
+	gitcfg := fmt.Sprintf("/home/%s/.gitconfig", opts.Username)
+	cmds := [][]string{
+		{"git", "config", "--file", gitcfg, "credential.helper", "!gh auth git-credential"},
+		{"git", "config", "--file", gitcfg, "user.name", opts.GHUserName},
+		{"git", "config", "--file", gitcfg, "user.email", opts.GHUserEmail},
+		{"chown", fmt.Sprintf("%d:%d", opts.UID, opts.GID), gitcfg},
+	}
+	for _, cmd := range cmds {
+		if _, err := c.ExecInstance(ctx, opts.Name, cmd); err != nil {
+			return fmt.Errorf("running %q: %w", cmd[0], err)
+		}
+	}
 	return nil
 }
 

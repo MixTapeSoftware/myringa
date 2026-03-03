@@ -3,6 +3,7 @@ package provision_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"testing"
@@ -351,6 +352,89 @@ func TestValidate_AcceptsValidProxy(t *testing.T) {
 	}
 }
 
+
+// ── Extra mount validation ─────────────────────────────────────────────────────
+
+func TestValidate_RejectsRelativeExtraMountHostPath(t *testing.T) {
+	opts := baseOpts()
+	opts.ExtraMounts = []provision.MountSpec{{HostPath: "relative/path", ContainerPath: "/notes"}}
+	if err := opts.Validate(); err == nil {
+		t.Error("expected error for relative HostPath in ExtraMounts")
+	}
+}
+
+func TestValidate_RejectsRelativeExtraMountContainerPath(t *testing.T) {
+	opts := baseOpts()
+	opts.ExtraMounts = []provision.MountSpec{{HostPath: "/host/notes", ContainerPath: "notes"}}
+	if err := opts.Validate(); err == nil {
+		t.Error("expected error for relative ContainerPath in ExtraMounts")
+	}
+}
+
+func TestValidate_RejectsDuplicateExtraMountContainerPath(t *testing.T) {
+	opts := baseOpts()
+	opts.ExtraMounts = []provision.MountSpec{
+		{HostPath: "/host/a", ContainerPath: "/notes"},
+		{HostPath: "/host/b", ContainerPath: "/notes"},
+	}
+	if err := opts.Validate(); err == nil {
+		t.Error("expected error for duplicate ContainerPath in ExtraMounts")
+	}
+}
+
+func TestValidate_RejectsExtraMountConflictingWithWorkspace(t *testing.T) {
+	opts := baseOpts()
+	opts.ExtraMounts = []provision.MountSpec{{HostPath: "/host/notes", ContainerPath: "/workspace"}}
+	if err := opts.Validate(); err == nil {
+		t.Error("expected error when ExtraMount ContainerPath conflicts with MountPath")
+	}
+}
+
+func TestValidate_AcceptsValidExtraMounts(t *testing.T) {
+	opts := baseOpts()
+	opts.ExtraMounts = []provision.MountSpec{
+		{HostPath: "/host/notes", ContainerPath: "/notes"},
+		{HostPath: "/host/docs", ContainerPath: "/docs"},
+	}
+	if err := opts.Validate(); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_RejectsGHTokenWithoutUserName(t *testing.T) {
+	opts := baseOpts()
+	opts.GHToken = "ghp_test123"
+	opts.GHUserEmail = "user@example.com"
+	if err := opts.Validate(); err == nil {
+		t.Error("expected error when GHToken set without GHUserName")
+	}
+}
+
+func TestValidate_RejectsGHTokenWithoutUserEmail(t *testing.T) {
+	opts := baseOpts()
+	opts.GHToken = "ghp_test123"
+	opts.GHUserName = "Test User"
+	if err := opts.Validate(); err == nil {
+		t.Error("expected error when GHToken set without GHUserEmail")
+	}
+}
+
+func TestValidate_AcceptsGHTokenWithIdentity(t *testing.T) {
+	opts := baseOpts()
+	opts.GHToken = "ghp_test123"
+	opts.GHUserName = "Test User"
+	opts.GHUserEmail = "user@example.com"
+	if err := opts.Validate(); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_AcceptsNoGHToken(t *testing.T) {
+	opts := baseOpts()
+	if err := opts.Validate(); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
 
 // ── Image alias resolution ─────────────────────────────────────────────────────
 
@@ -775,6 +859,163 @@ func TestLaunch_DockerProfileAlwaysIncluded(t *testing.T) {
 
 	if !mc.profiles["ring-docker"] {
 		t.Error("ring-docker profile must always be synced")
+	}
+}
+
+// ── Extra mounts in Launch ─────────────────────────────────────────────────────
+
+func TestLaunch_AddsExtraMounts_ShiftTrue(t *testing.T) {
+	mc := newMockClient()
+	opts := baseOpts()
+	opts.ExtraMounts = []provision.MountSpec{
+		{HostPath: "/host/notes", ContainerPath: "/notes"},
+		{HostPath: "/host/docs", ContainerPath: "/docs"},
+	}
+	if err := provision.Launch(context.Background(), mc, opts, io.Discard); err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	for i, m := range opts.ExtraMounts {
+		devName := fmt.Sprintf("mount-%d", i)
+		dev := mc.instanceDevices["mydev"][devName]
+		if dev == nil {
+			t.Fatalf("device %q not added", devName)
+		}
+		if dev["shift"] != "true" {
+			t.Errorf("device %q: expected shift=true, got %q", devName, dev["shift"])
+		}
+		if dev["source"] != m.HostPath {
+			t.Errorf("device %q source: got %q, want %q", devName, dev["source"], m.HostPath)
+		}
+		if dev["path"] != m.ContainerPath {
+			t.Errorf("device %q path: got %q, want %q", devName, dev["path"], m.ContainerPath)
+		}
+	}
+}
+
+func TestLaunch_AddsExtraMounts_ShiftFallback(t *testing.T) {
+	mc := newMockClient()
+	mc.shiftUnsupported = true
+	opts := baseOpts()
+	opts.ExtraMounts = []provision.MountSpec{
+		{HostPath: "/host/notes", ContainerPath: "/notes"},
+	}
+	if err := provision.Launch(context.Background(), mc, opts, io.Discard); err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	dev := mc.instanceDevices["mydev"]["mount-0"]
+	if dev == nil {
+		t.Fatal("device mount-0 not added")
+	}
+	if dev["shift"] == "true" {
+		t.Error("device mount-0 must not have shift=true when shift is unsupported")
+	}
+	if dev["source"] != "/host/notes" {
+		t.Errorf("mount-0 source: got %q, want /host/notes", dev["source"])
+	}
+	if dev["path"] != "/notes" {
+		t.Errorf("mount-0 path: got %q, want /notes", dev["path"])
+	}
+}
+
+func TestDryRun_ShowsExtraMounts(t *testing.T) {
+	opts := baseOpts()
+	opts.ExtraMounts = []provision.MountSpec{
+		{HostPath: "/host/notes", ContainerPath: "/notes"},
+		{HostPath: "/host/docs", ContainerPath: "/docs"},
+	}
+	plan, err := provision.DryRun(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("DryRun failed: %v", err)
+	}
+	if !containsStr(plan, "Mount[0]:  /host/notes → /notes") {
+		t.Errorf("plan must show mount-0, got: %s", plan)
+	}
+	if !containsStr(plan, "Mount[1]:  /host/docs → /docs") {
+		t.Errorf("plan must show mount-1, got: %s", plan)
+	}
+}
+
+// ── GitHub token ──────────────────────────────────────────────────────────────
+
+func TestDryRun_WithGHToken(t *testing.T) {
+	opts := baseOpts()
+	opts.GHToken = "ghp_test123"
+	opts.GHUserName = "Test User"
+	opts.GHUserEmail = "user@example.com"
+
+	plan, err := provision.DryRun(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("DryRun failed: %v", err)
+	}
+	if !containsStr(plan, "GH_TOKEN set") {
+		t.Errorf("plan must mention GH_TOKEN, got: %s", plan)
+	}
+	if !containsStr(plan, "Test User") {
+		t.Errorf("plan must mention git user.name, got: %s", plan)
+	}
+}
+
+func TestDryRun_WithoutGHToken(t *testing.T) {
+	plan, err := provision.DryRun(context.Background(), baseOpts())
+	if err != nil {
+		t.Fatalf("DryRun failed: %v", err)
+	}
+	if !containsStr(plan, "not configured") {
+		t.Errorf("plan must say GitHub not configured, got: %s", plan)
+	}
+}
+
+func TestLaunch_WithGHToken_SetsEnvAndGitConfig(t *testing.T) {
+	mc := newMockClient()
+	opts := baseOpts()
+	opts.GHToken = "ghp_test123"
+	opts.GHUserName = "Test User"
+	opts.GHUserEmail = "user@example.com"
+
+	if err := provision.Launch(context.Background(), mc, opts, io.Discard); err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+
+	cfg := mc.instanceConfigs["mydev"]
+	if cfg["environment.GH_TOKEN"] != "ghp_test123" {
+		t.Errorf("GH_TOKEN: got %q, want ghp_test123", cfg["environment.GH_TOKEN"])
+	}
+	if cfg["environment.GITHUB_TOKEN"] != "ghp_test123" {
+		t.Errorf("GITHUB_TOKEN: got %q, want ghp_test123", cfg["environment.GITHUB_TOKEN"])
+	}
+}
+
+func TestLaunch_WithoutGHToken_NoGHConfig(t *testing.T) {
+	mc := newMockClient()
+	if err := provision.Launch(context.Background(), mc, baseOpts(), io.Discard); err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+
+	cfg := mc.instanceConfigs["mydev"]
+	if _, ok := cfg["environment.GH_TOKEN"]; ok {
+		t.Error("GH_TOKEN must not be set when no token configured")
+	}
+}
+
+func TestLaunch_GHToken_UpdateConfigError(t *testing.T) {
+	mc := newMockClient()
+	// We need UpdateInstanceConfig to succeed for the workspace mount but fail for GH_TOKEN.
+	// Since configureGitHub runs after start, we can use a counter approach.
+	// Instead, set the error after launch starts — but mock doesn't support that easily.
+	// Simplest: test that configureGitHub failure propagates by making ExecInstance fail
+	// for git config commands.
+	mc.execResults["mydev:git"] = execResult{err: errors.New("git config failed")}
+	opts := baseOpts()
+	opts.GHToken = "ghp_test123"
+	opts.GHUserName = "Test User"
+	opts.GHUserEmail = "user@example.com"
+
+	err := provision.Launch(context.Background(), mc, opts, io.Discard)
+	if err == nil {
+		t.Error("expected error when git config fails")
+	}
+	if !containsStr(err.Error(), "configuring GitHub auth") {
+		t.Errorf("error must mention GitHub auth, got: %v", err)
 	}
 }
 

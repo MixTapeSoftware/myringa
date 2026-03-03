@@ -12,10 +12,12 @@
 
 bash
 build-base
+chromium
 gcompat
 curl
 doas
 git
+github-cli
 gnupg
 gzip
 htop

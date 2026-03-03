@@ -46,20 +46,30 @@ func TestSubcommandRoute_EnterAlias(t *testing.T) {
 }
 
 func TestEnterShellArgs_UserExists(t *testing.T) {
-	got := enterShellArgs("/usr/bin/incus", "mydev", "chad", true)
-	want := []string{"/usr/bin/incus", "exec", "mydev", "--", "su", "-", "chad"}
-	if len(got) != len(want) {
-		t.Fatalf("got %v, want %v", got, want)
+	got := enterShellArgs("/usr/bin/incus", "mydev", "chad", 1000, true)
+	// Should use incus exec --user/--group/--cwd instead of su -
+	if got[0] != "/usr/bin/incus" || got[1] != "exec" || got[2] != "mydev" {
+		t.Errorf("unexpected prefix: %v", got[:3])
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("[%d]: got %q, want %q", i, got[i], want[i])
+	// Must contain --user 1000
+	found := false
+	for i, arg := range got {
+		if arg == "--user" && i+1 < len(got) && got[i+1] == "1000" {
+			found = true
+			break
 		}
+	}
+	if !found {
+		t.Errorf("expected --user 1000 in args, got %v", got)
+	}
+	// Must end with /bin/zsh -l
+	if got[len(got)-2] != "/bin/zsh" || got[len(got)-1] != "-l" {
+		t.Errorf("expected login shell at end, got %v", got[len(got)-2:])
 	}
 }
 
 func TestEnterShellArgs_UserMissing_FallsBackToRoot(t *testing.T) {
-	got := enterShellArgs("/usr/bin/incus", "mydev", "chad", false)
+	got := enterShellArgs("/usr/bin/incus", "mydev", "chad", 1000, false)
 	want := []string{"/usr/bin/incus", "exec", "mydev", "--", "/bin/zsh"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -141,6 +151,80 @@ func TestParseLaunchFlags_Proxy(t *testing.T) {
 	}
 	if opts.Proxy != "proxy.corp.com:3128" {
 		t.Errorf("proxy: got %q, want proxy.corp.com:3128", opts.Proxy)
+	}
+}
+
+func TestParseLaunchFlags_GHToken(t *testing.T) {
+	// --gh-token is a bool flag; it shouldn't consume the next arg.
+	// We can't fully test the interactive prompt here, but we can verify
+	// the flag is recognized without error when no prompt is attached.
+	// Since promptGHCredentials reads stdin, we just test isBoolFlag.
+	if !isBoolFlag("--gh-token") {
+		t.Error("--gh-token must be recognized as a bool flag")
+	}
+}
+
+func TestIsBoolFlag_GHToken(t *testing.T) {
+	if !isBoolFlag("--gh-token") {
+		t.Error("isBoolFlag must return true for --gh-token")
+	}
+	if !isBoolFlag("-gh-token") {
+		t.Error("isBoolFlag must return true for -gh-token")
+	}
+}
+
+func TestParseLaunchFlags_Mount_Single(t *testing.T) {
+	dir := t.TempDir()
+	opts, err := parseLaunchFlags([]string{"mydev", "--mount", dir + ":/notes"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(opts.ExtraMounts) != 1 {
+		t.Fatalf("expected 1 extra mount, got %d", len(opts.ExtraMounts))
+	}
+	if opts.ExtraMounts[0].HostPath != dir {
+		t.Errorf("host path: got %q, want %q", opts.ExtraMounts[0].HostPath, dir)
+	}
+	if opts.ExtraMounts[0].ContainerPath != "/notes" {
+		t.Errorf("container path: got %q, want /notes", opts.ExtraMounts[0].ContainerPath)
+	}
+}
+
+func TestParseLaunchFlags_Mount_Multiple(t *testing.T) {
+	dir1 := t.TempDir()
+	dir2 := t.TempDir()
+	opts, err := parseLaunchFlags([]string{"mydev", "--mount", dir1 + ":/notes", "--mount", dir2 + ":/docs"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(opts.ExtraMounts) != 2 {
+		t.Fatalf("expected 2 extra mounts, got %d", len(opts.ExtraMounts))
+	}
+	if opts.ExtraMounts[0].ContainerPath != "/notes" {
+		t.Errorf("mount 0 container path: got %q, want /notes", opts.ExtraMounts[0].ContainerPath)
+	}
+	if opts.ExtraMounts[1].ContainerPath != "/docs" {
+		t.Errorf("mount 1 container path: got %q, want /docs", opts.ExtraMounts[1].ContainerPath)
+	}
+}
+
+func TestParseLaunchFlags_Mount_InvalidFormat(t *testing.T) {
+	// No colon
+	_, err := parseLaunchFlags([]string{"mydev", "--mount", "/tmp/notes"})
+	if err == nil {
+		t.Error("expected error for mount without colon")
+	}
+
+	// Relative host path
+	_, err = parseLaunchFlags([]string{"mydev", "--mount", "relative:/notes"})
+	if err == nil {
+		t.Error("expected error for relative host path in mount")
+	}
+
+	// Relative container path
+	_, err = parseLaunchFlags([]string{"mydev", "--mount", "/tmp/notes:notes"})
+	if err == nil {
+		t.Error("expected error for relative container path in mount")
 	}
 }
 

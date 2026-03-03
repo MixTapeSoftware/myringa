@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -16,6 +17,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/lxc/incus/v6/shared/api"
+	"golang.org/x/term"
 
 	"ring/internal/images"
 	"ring/internal/incus"
@@ -99,6 +101,9 @@ func runLaunch(args []string) {
 
 	spin.Stop()
 	fmt.Printf("Container %q is ready.\n", opts.Name)
+	if opts.GHToken != "" {
+		fmt.Printf("  GitHub: GH_TOKEN set — git identity %s <%s>\n", opts.GHUserName, opts.GHUserEmail)
+	}
 }
 
 // parseArgs returns the subcommand and remaining arguments.
@@ -125,6 +130,12 @@ func parseArgs(args []string) (command, []string) {
 
 // parseLaunchFlags parses args for the launch subcommand into LaunchOpts.
 // The container name is the first non-flag argument and may appear anywhere in args.
+// stringSlice implements flag.Value for repeatable string flags.
+type stringSlice []string
+
+func (s *stringSlice) String() string { return strings.Join(*s, ", ") }
+func (s *stringSlice) Set(v string) error { *s = append(*s, v); return nil }
+
 func parseLaunchFlags(args []string) (provision.LaunchOpts, error) {
 	// Separate the container name (first non-flag arg) from flag args so that
 	// flag.Parse sees only flags, regardless of where the name appears.
@@ -138,6 +149,9 @@ func parseLaunchFlags(args []string) (provision.LaunchOpts, error) {
 	workspace := fs.String("workspace", "", "Host directory to mount (default: cwd)")
 	mountPath := fs.String("mount-path", "/workspace", "Container mount point")
 	dryRun := fs.Bool("dry-run", false, "Show what would be done without making changes")
+	ghToken := fs.Bool("gh-token", false, "Configure GitHub CLI + git auth (prompts for PAT and git identity)")
+	var mounts stringSlice
+	fs.Var(&mounts, "mount", "/host/path:/container/path (repeatable)")
 
 	if err := fs.Parse(flagArgs); err != nil {
 		return provision.LaunchOpts{}, err
@@ -157,6 +171,28 @@ func parseLaunchFlags(args []string) (provision.LaunchOpts, error) {
 		ws = cwd
 	}
 
+	// Parse --mount values into MountSpecs.
+	var extraMounts []provision.MountSpec
+	for _, raw := range mounts {
+		parts := strings.SplitN(raw, ":", 2)
+		if len(parts) != 2 {
+			return provision.LaunchOpts{}, fmt.Errorf("--mount %q: expected /host/path:/container/path", raw)
+		}
+		hostPath, containerPath := parts[0], parts[1]
+		if !strings.HasPrefix(hostPath, "/") || !strings.HasPrefix(containerPath, "/") {
+			return provision.LaunchOpts{}, fmt.Errorf("--mount %q: both paths must be absolute", raw)
+		}
+		if info, err := os.Stat(hostPath); err != nil {
+			return provision.LaunchOpts{}, fmt.Errorf("--mount %q: host path does not exist: %w", raw, err)
+		} else if !info.IsDir() {
+			return provision.LaunchOpts{}, fmt.Errorf("--mount %q: host path is not a directory", raw)
+		}
+		extraMounts = append(extraMounts, provision.MountSpec{
+			HostPath:      hostPath,
+			ContainerPath: containerPath,
+		})
+	}
+
 	// Default username/UID/GID from current user.
 	u, err := user.Current()
 	if err != nil {
@@ -166,18 +202,31 @@ func parseLaunchFlags(args []string) (provision.LaunchOpts, error) {
 	gid, _ := strconv.Atoi(u.Gid)
 	username := u.Username
 
-	return provision.LaunchOpts{
-		Name:      name,
-		Distro:    *distro,
-		Sudo:      *enableSudo,
-		Proxy:     *proxy,
-		Workspace: ws,
-		MountPath: *mountPath,
-		Username:  username,
-		UID:       uid,
-		GID:       gid,
-		DryRun:    *dryRun,
-	}, nil
+	opts := provision.LaunchOpts{
+		Name:        name,
+		Distro:      *distro,
+		Sudo:        *enableSudo,
+		Proxy:       *proxy,
+		Workspace:   ws,
+		MountPath:   *mountPath,
+		ExtraMounts: extraMounts,
+		Username:    username,
+		UID:         uid,
+		GID:         gid,
+		DryRun:      *dryRun,
+	}
+
+	if *ghToken {
+		creds, err := promptGHCredentials()
+		if err != nil {
+			return provision.LaunchOpts{}, err
+		}
+		opts.GHToken = creds.token
+		opts.GHUserName = creds.name
+		opts.GHUserEmail = creds.email
+	}
+
+	return opts, nil
 }
 
 const launchUsage = `
@@ -188,11 +237,14 @@ Usage: ring launch [flags] <name>
   --proxy string        HTTP proxy host:port
   --workspace string    Host directory to mount (default: cwd)
   --mount-path string   Container mount point (default: /workspace)
+  --mount string        Extra bind mount /host/path:/container/path (repeatable)
+  --gh-token            Configure GitHub CLI + git auth (prompts for PAT and git identity)
   --dry-run             Show what would be done
 
 Examples:
   ring launch mydev
   ring launch mydev --distro ubuntu
+  ring launch mydev --mount /home/chad/Dropbox/notes:/notes
   ring launch mydev --dry-run
 `
 
@@ -297,7 +349,8 @@ func runEnter(args []string) {
 	// after ring launch and the instance hasn't fully initialized yet.
 	userExists := waitForUser(context.Background(), c, name, u.Username, 5*time.Second)
 
-	argv := enterShellArgs(incusBin, name, u.Username, userExists)
+	uid, _ := strconv.Atoi(u.Uid)
+	argv := enterShellArgs(incusBin, name, u.Username, uid, userExists)
 	if err := syscall.Exec(incusBin, argv, os.Environ()); err != nil {
 		fmt.Fprintln(os.Stderr, "ring enter:", err)
 		os.Exit(1)
@@ -322,11 +375,21 @@ func waitForUser(ctx context.Context, c incus.Client, container, username string
 }
 
 // enterShellArgs returns the argv for exec-ing into a container.
-// When userExists is true it opens a login shell as that user via su;
-// otherwise it falls back to a root shell.
-func enterShellArgs(incusBin, container, username string, userExists bool) []string {
+// When userExists is true it opens a login shell as that user using
+// incus exec --user/--group/--cwd, which preserves Incus environment.*
+// variables (su - would wipe them). Otherwise falls back to a root shell.
+func enterShellArgs(incusBin, container, username string, uid int, userExists bool) []string {
 	if userExists {
-		return []string{incusBin, "exec", container, "--", "su", "-", username}
+		return []string{
+			incusBin, "exec", container,
+			"--user", strconv.Itoa(uid),
+			"--group", strconv.Itoa(uid),
+			"--cwd", "/home/" + username,
+			"--env", "HOME=/home/" + username,
+			"--env", "USER=" + username,
+			"--env", "SHELL=/bin/zsh",
+			"--", "/bin/zsh", "-l",
+		}
 	}
 	return []string{incusBin, "exec", container, "--", "/bin/zsh"}
 }
@@ -372,8 +435,60 @@ func isBoolFlag(arg string) bool {
 	boolFlags := map[string]bool{
 		"enable-sudo": true,
 		"dry-run":     true,
+		"gh-token":    true,
 	}
 	return boolFlags[name]
+}
+
+// ── GitHub credential prompts ────────────────────────────────────────────────
+
+type ghCreds struct{ token, name, email string }
+
+func promptGHCredentials() (ghCreds, error) {
+	fmt.Println("GitHub fine-grained PAT:")
+	fmt.Println("  https://github.com/settings/tokens?type=beta")
+	fmt.Print("PAT: ")
+	raw, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Println()
+	if err != nil {
+		return ghCreds{}, fmt.Errorf("reading token: %w", err)
+	}
+	token := strings.TrimSpace(string(raw))
+	if token == "" {
+		return ghCreds{}, fmt.Errorf("token must not be empty")
+	}
+
+	defaultName := gitConfigValue("user.name")
+	defaultEmail := gitConfigValue("user.email")
+	name := promptLine(fmt.Sprintf("git user.name [%s]: ", defaultName), defaultName)
+	email := promptLine(fmt.Sprintf("git user.email [%s]: ", defaultEmail), defaultEmail)
+
+	if name == "" {
+		return ghCreds{}, fmt.Errorf("git user.name must not be empty")
+	}
+	if email == "" {
+		return ghCreds{}, fmt.Errorf("git user.email must not be empty")
+	}
+	return ghCreds{token: token, name: name, email: email}, nil
+}
+
+// gitConfigValue reads a key from the host's global git config. Returns "" on any error.
+func gitConfigValue(key string) string {
+	out, err := exec.Command("git", "config", "--global", key).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// promptLine reads a trimmed line from stdin, returning defaultVal on empty input.
+func promptLine(prompt, defaultVal string) string {
+	fmt.Print(prompt)
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	if v := strings.TrimSpace(line); v != "" {
+		return v
+	}
+	return defaultVal
 }
 
 // incusProvisionAdapter bridges incus.Client to provision.Client.
