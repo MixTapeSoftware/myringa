@@ -10,7 +10,13 @@
       "WebSearch",
       "WebFetch(*)",
       "NotebookEdit(*)",
-      "Task(*)"
+      "Task(*)",
+      "Agent(*)",
+      "mcp__*"
     ]
-  }
+  },
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "plansDirectory": ".claude/plans"
 }
